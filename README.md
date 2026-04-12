@@ -1,50 +1,267 @@
-# ManLv Backend
+<div align="center">
 
-Node.js backend for ManLv email parsing application.
+# 漫旅 ManLv · 后端服务
 
-## Setup
+**The Wandering Scholar · Backend**
 
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
+*AI Agent 驱动的保研行程管理后端服务*
 
-2. Set up PostgreSQL database and update `DATABASE_URL` in `.env`.
+[![Node.js](https://img.shields.io/badge/Node.js-Express-339933?style=flat-square&logo=node.js)](https://nodejs.org/)
+[![Prisma](https://img.shields.io/badge/Prisma-ORM-2D3748?style=flat-square&logo=prisma)](https://www.prisma.io/)
+[![PostgreSQL](https://img.shields.io/badge/PostgreSQL-Database-4169E1?style=flat-square&logo=postgresql)](https://www.postgresql.org/)
+[![AI](https://img.shields.io/badge/AI-Qwen%20%2F%20DashScope-FF6A00?style=flat-square)](https://dashscope.aliyuncs.com/)
 
-3. Run Prisma migrations:
-   ```bash
-   npx prisma migrate dev --name init
-   ```
+[前端仓库](https://github.com/caoyuxuan200205-sketch/manlv-frontend) · [后端仓库](https://github.com/caoyuxuan200205-sketch/manlv-backend)
 
-4. Generate Prisma client:
-   ```bash
-   npx prisma generate
-   ```
+</div>
 
-5. Start the server:
-   ```bash
-   npm run dev
-   ```
+---
 
-## API Endpoints
+## 🎯 简介
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login user
+漫旅后端基于 **Node.js + Express** 构建，提供用户认证、行程管理、邮件处理等 REST API，并内置 **AI Agent 循环**，通过 DashScope（兼容 OpenAI 格式）驱动 Qwen 大模型，支持工具调用与 SSE 流式输出。
 
-### User
-- `GET /api/user` - Get user profile (requires auth)
+---
 
-### Emails
-- `GET /api/emails` - Get all emails for user (requires auth)
-- `POST /api/emails` - Create new email (requires auth)
-- `PUT /api/emails/:id` - Update email (requires auth)
-- `DELETE /api/emails/:id` - Delete email (requires auth)
+## 🛠️ 技术栈
 
-## Phase 2: Email Parsing
+| 层次 | 技术方案 |
+|------|----------|
+| 运行时 | Node.js |
+| Web 框架 | Express |
+| ORM | Prisma |
+| 数据库 | PostgreSQL |
+| 认证 | JWT · bcryptjs |
+| AI | Qwen-Plus / Qwen-Max（DashScope，兼容 OpenAI 格式）|
+| 流式输出 | SSE（Server-Sent Events）|
 
-Next phase will include:
-- OAuth 2.0 email authorization
-- IMAP email fetching
-- LLM parsing with structured output
-- Database storage of parsed data
+---
+
+## 🚀 快速开始
+
+### 环境要求
+
+- Node.js ≥ 18
+- PostgreSQL 数据库
+- DashScope API Key（[申请地址](https://dashscope.aliyuncs.com)）
+
+### 安装与启动
+
+```bash
+# 克隆仓库
+git clone https://github.com/caoyuxuan200205-sketch/manlv-backend.git
+cd manlv-backend
+
+# 安装依赖
+npm install
+
+# 配置环境变量
+cp .env.example .env
+# 编辑 .env 填入配置（见下方说明）
+
+# 初始化数据库
+npx prisma migrate dev --name init
+
+# 生成 Prisma 客户端
+npx prisma generate
+
+# 启动服务
+node src/server.js
+# 服务运行在 http://localhost:3001
+```
+
+### 环境变量配置（`.env`）
+
+```env
+# 数据库
+DATABASE_URL="postgresql://用户名:密码@localhost:5432/manlv"
+
+# JWT 密钥（自定义任意字符串）
+JWT_SECRET=your_jwt_secret_here
+
+# 服务端口
+PORT=3001
+
+# AI 配置（DashScope）
+AI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+AI_API_KEY=sk-xxxxxxxxxxxxxxxx
+AI_MODEL=qwen-plus
+AI_MAX_STEPS=6
+
+# AI 系统提示词（可选，有默认值）
+AI_SYSTEM_PROMPT=你是漫旅 AI 助手。你的目标是帮助用户完成保研行程管理、冲突分析、面试准备，并在需要时调用可用工具。请先思考，再给出简洁、可执行的建议。
+```
+
+**AI 模型选择参考：**
+
+| 模型 | 支持 Function Calling | 速度 | 推荐场景 |
+|------|----------------------|------|----------|
+| `qwen-plus` | ✅ | 中 | 日常使用，推荐 |
+| `qwen-max` | ✅ | 慢 | 复杂规划，效果更好 |
+| `qwen-turbo` | ✅ | 快 | 简单问答，省额度 |
+
+---
+
+## 🔌 API 接口
+
+所有需要认证的接口请在请求头中携带：
+```
+Authorization: Bearer <token>
+```
+
+### 认证
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/auth/register` | 用户注册 |
+| POST | `/api/auth/login` | 用户登录，返回 JWT Token |
+| POST | `/api/auth/reset-password` | 重置密码 |
+
+### 用户
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/user` | 获取当前用户信息（需认证）|
+| PUT | `/api/user` | 更新用户资料，支持 name / email / major / password（需认证）|
+
+### 面试安排
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/interviews` | 获取面试列表，按日期升序（需认证）|
+| POST | `/api/interviews` | 新增面试安排（需认证）|
+
+### 邮件
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| GET | `/api/emails` | 获取邮件列表（需认证）|
+| POST | `/api/emails` | 新增邮件（需认证）|
+| PUT | `/api/emails/:id` | 更新邮件（需认证）|
+| DELETE | `/api/emails/:id` | 删除邮件（需认证）|
+
+### AI 对话（核心）
+
+| 方法 | 路径 | 说明 |
+|------|------|------|
+| POST | `/api/ai/chat` | AI 对话，SSE 流式输出（需认证）|
+
+---
+
+## 🤖 AI Agent 架构
+
+### 流式输出（SSE）
+
+`POST /api/ai/chat` 返回 `Content-Type: text/event-stream`，客户端实时接收以下事件：
+
+```json
+{ "type": "thinking", "tool": "analyze_schedule_conflicts" }
+{ "type": "text", "content": "根据你的面试安排..." }
+{ "type": "done", "usedTools": [{ "name": "analyze_schedule_conflicts", "ok": true }] }
+{ "type": "error", "message": "AI 服务不可用" }
+```
+
+### 请求格式
+
+```json
+{
+  "message": "帮我分析7月20日的行程冲突",
+  "messages": [
+    { "role": "user", "content": "你好" },
+    { "role": "assistant", "content": "你好！有什么可以帮你？" },
+    { "role": "user", "content": "帮我分析7月20日的行程冲突" }
+  ]
+}
+```
+
+传入 `messages` 数组支持多轮对话；仅传 `message` 字符串则为单轮对话。
+
+### 内置工具（Function Calling）
+
+| 工具名 | 说明 |
+|--------|------|
+| `get_user_profile` | 获取当前用户基础资料 |
+| `list_interviews` | 查询用户面试安排列表 |
+| `create_interview` | 创建新的面试记录 |
+| `analyze_schedule_conflicts` | 分析同日行程冲突 |
+
+### Agent 工作流程
+
+```
+用户输入
+  └→ 发送给 Qwen 模型
+       ├→ 返回 tool_calls → 执行工具 → SSE 推送 thinking 事件 → 结果追加到对话 → 继续循环
+       └→ 无 tool_calls  → 切换流式模式 → SSE 逐字推送 text 事件 → 推送 done 事件
+```
+
+最大工具调用轮次由 `AI_MAX_STEPS` 控制，默认 6 次。
+
+---
+
+## 📁 项目结构
+
+```
+manlv-backend/
+├── src/
+│   ├── server.js          # 主服务（所有路由 + AI Agent）
+│   └── generated/         # Prisma 生成的客户端文件
+├── prisma/
+│   └── schema.prisma      # 数据库模型定义
+├── .env                   # 环境变量（不提交 Git）
+├── .env.example           # 环境变量模板
+└── package.json
+```
+
+---
+
+## 🗄️ 数据模型
+
+```prisma
+model User {
+  id          String      @id @default(cuid())
+  email       String      @unique
+  password    String
+  name        String?
+  major       String?
+  interviews  Interview[]
+  emails      Email[]
+}
+
+model Interview {
+  id      String   @id @default(cuid())
+  userId  String
+  school  String
+  major   String
+  date    DateTime
+  city    String
+  type    String
+  user    User     @relation(fields: [userId], references: [id])
+}
+
+model Email {
+  id          String   @id @default(cuid())
+  userId      String
+  subject     String
+  body        String
+  sender      String
+  receivedAt  DateTime
+  parsedData  Json?
+  user        User     @relation(fields: [userId], references: [id])
+}
+```
+
+---
+
+## 🛣️ 后续规划
+
+| 版本 | 计划功能 |
+|------|----------|
+| V1.x | 天气查询工具 · 多轮对话持久化 · 对话历史存储 |
+| V2.0 | 邮箱 OAuth 授权 · NLP 邮件解析 · 票务酒店 API 接入 |
+| V3.0 | 导师知识图谱 · 城市学习内容生成 · 情绪监测系统 |
+
+---
+
+## 📄 License
+
+MIT © 2026 漫旅 ManLv
