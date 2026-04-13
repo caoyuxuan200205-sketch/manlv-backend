@@ -1,8 +1,11 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
 
 const app = express();
@@ -12,11 +15,34 @@ const AI_BASE_URL = (process.env.AI_BASE_URL || '').replace(/\/+$/, '');
 const AI_API_KEY = process.env.AI_API_KEY || '';
 const AI_MODEL = process.env.AI_MODEL || '';
 const AI_MAX_STEPS = Number(process.env.AI_MAX_STEPS || 6);
-const AI_SYSTEM_PROMPT = process.env.AI_SYSTEM_PROMPT || '你是漫旅 AI 助手。你的目标是帮助用户完成保研行程管理、冲突分析、面试准备，并在需要时调用可用工具。请先思考，再给出简洁、可执行的建议。';
+const AMAP_API_KEY = process.env.AMAP_API_KEY || '';
+const AI_SYSTEM_PROMPT = process.env.AI_SYSTEM_PROMPT || '你是 ManLv AI 助手，帮助用户完成面试行程管理、冲突分析和准备建议，并在需要时调用可用工具。';
 
 // Middleware
 app.use(cors());
 app.use(express.json());
+
+// 配置文件上传
+const upload = multer({ 
+  dest: 'uploads/',
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB 限制
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = ['application/pdf', 'image/jpeg', 'image/png', 'image/jpg', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 'application/msword'];
+    const allowedExtensions = ['.pdf', '.jpg', '.jpeg', '.png', '.doc', '.docx'];
+    const hasAllowedType = allowedTypes.includes(file.mimetype);
+    const hasAllowedExt = allowedExtensions.some(ext => file.originalname.toLowerCase().endsWith(ext));
+    if (hasAllowedType || hasAllowedExt) {
+      cb(null, true);
+    } else {
+      cb(new Error('只支持 PDF、图片和 Word 文档格式'));
+    }
+  }
+});
+
+// 确保上传目录存在
+if (!fs.existsSync('uploads')) {
+  fs.mkdirSync('uploads');
+}
 
 const aiTools = [
   {
@@ -74,6 +100,23 @@ const aiTools = [
       }
     }
   }
+  ,
+  {
+    type: 'function',
+    function: {
+      name: 'get_weather',
+      description: '查询指定城市的天气信息，支持实时天气或未来预报',
+      parameters: {
+        type: 'object',
+        properties: {
+          city: { type: 'string', description: '城市名、adcode 或 citycode，例如 北京、上海、110000' },
+          mode: { type: 'string', enum: ['current', 'forecast'], description: 'current=实时天气, forecast=天气预报' }
+        },
+        required: ['city'],
+        additionalProperties: false
+      }
+    }
+  }
 ];
 
 const toDayKey = (value) => {
@@ -82,6 +125,104 @@ const toDayKey = (value) => {
   return d.toISOString().slice(0, 10);
 };
 
+
+const fetchAmapJson = async (url) => {
+  const response = await fetch(url);
+  const text = await response.text();
+  let data = {};
+  try {
+    data = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`高德接口返回非 JSON: ${text.slice(0, 120)}`);
+  }
+
+  if (!response.ok) {
+    const message = data?.info || text || `HTTP ${response.status}`;
+    throw new Error(`高德接口请求失败: ${message}`);
+  }
+  if (data?.status !== '1') {
+    throw new Error(`高德接口业务失败: ${data?.info || 'unknown error'}`);
+  }
+  return data;
+};
+
+const resolveAmapCityCode = async (cityInput) => {
+  const raw = (cityInput || '').trim();
+  if (!raw) throw new Error('城市参数不能为空');
+
+  if (/^\d{6}$/.test(raw)) {
+    return { cityCode: raw, cityName: raw };
+  }
+
+  const params = new URLSearchParams({
+    key: AMAP_API_KEY,
+    keywords: raw,
+    subdistrict: '0',
+    extensions: 'base'
+  });
+  const url = `https://restapi.amap.com/v3/config/district?${params.toString()}`;
+  const data = await fetchAmapJson(url);
+  const first = Array.isArray(data?.districts) ? data.districts[0] : null;
+  if (!first?.adcode) {
+    throw new Error(`未找到城市: ${raw}`);
+  }
+  return { cityCode: first.adcode, cityName: first.name || raw };
+};
+
+const getAmapWeather = async ({ city, mode = 'current' }) => {
+  if (!AMAP_API_KEY) {
+    throw new Error('缺少 AMAP_API_KEY 配置');
+  }
+
+  const weatherMode = mode === 'forecast' ? 'all' : 'base';
+  const { cityCode, cityName } = await resolveAmapCityCode(city);
+  const params = new URLSearchParams({
+    key: AMAP_API_KEY,
+    city: cityCode,
+    extensions: weatherMode
+  });
+  const url = `https://restapi.amap.com/v3/weather/weatherInfo?${params.toString()}`;
+  const data = await fetchAmapJson(url);
+
+  if (weatherMode === 'base') {
+    const live = Array.isArray(data?.lives) ? data.lives[0] : null;
+    if (!live) throw new Error('未获取到实时天气');
+    return {
+      type: 'current',
+      city: live.city || cityName,
+      adcode: live.adcode || cityCode,
+      weather: live.weather,
+      temperature: live.temperature,
+      windDirection: live.winddirection,
+      windPower: live.windpower,
+      humidity: live.humidity,
+      reportTime: live.reporttime
+    };
+  }
+
+  const forecast = Array.isArray(data?.forecasts) ? data.forecasts[0] : null;
+  if (!forecast) throw new Error('未获取到天气预报');
+  return {
+    type: 'forecast',
+    city: forecast.city || cityName,
+    adcode: forecast.adcode || cityCode,
+    reportTime: forecast.reporttime,
+    casts: Array.isArray(forecast.casts)
+      ? forecast.casts.map((item) => ({
+          date: item.date,
+          week: item.week,
+          dayWeather: item.dayweather,
+          nightWeather: item.nightweather,
+          dayTemp: item.daytemp,
+          nightTemp: item.nighttemp,
+          dayWind: item.daywind,
+          nightWind: item.nightwind,
+          dayPower: item.daypower,
+          nightPower: item.nightpower
+        }))
+      : []
+  };
+};
 const runAiTool = async (name, args, userId) => {
   if (name === 'get_user_profile') {
     const user = await prisma.user.findUnique({
@@ -137,6 +278,19 @@ const runAiTool = async (name, args, userId) => {
         }))
       }));
     return { ok: true, data: { totalInterviews: interviews.length, conflicts } };
+  }
+
+  if (name === 'get_weather') {
+    const { city, mode } = args || {};
+    if (!city || typeof city !== 'string') {
+      return { ok: false, error: 'city 参数缺失或格式错误' };
+    }
+    try {
+      const weather = await getAmapWeather({ city, mode });
+      return { ok: true, data: weather };
+    } catch (error) {
+      return { ok: false, error: error.message || '天气查询失败' };
+    }
   }
 
   return { ok: false, error: `不支持的工具: ${name}` };
@@ -246,7 +400,7 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
     
-    // 生成 JWT Token
+    // 鐢熸垚 JWT Token
     const token = jwt.sign({ id: user.id, email: user.email }, process.env.JWT_SECRET);
     res.json({ 
       token, 
@@ -440,6 +594,84 @@ app.get('/api/interviews', authenticateToken, async (req, res) => {
   }
 });
 
+// 解析简历文件（支持 Word 文档）
+app.post('/api/parse-resume', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '未上传文件' });
+    }
+
+    const filePath = req.file.path;
+    const fileName = req.file.originalname;
+    const fileExt = path.extname(fileName).toLowerCase();
+    
+    let text = '';
+    let isScanned = false;
+
+    // 根据文件类型选择解析方式
+    if (fileExt === '.docx') {
+      // 使用 mammoth 解析 docx
+      try {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ path: filePath });
+        text = result.value;
+        if (result.messages && result.messages.length > 0) {
+          console.log('[mammoth 解析消息]', result.messages);
+        }
+      } catch (parseError) {
+        console.error('[docx 解析失败]', parseError);
+        // 清理文件
+        fs.unlinkSync(filePath);
+        return res.status(500).json({ error: 'DOCX 解析失败: ' + parseError.message });
+      }
+    } else if (fileExt === '.doc') {
+      // .doc 文件需要转换为 docx 或使用其他工具
+      // 这里先返回提示，后续可以添加更多解析方式
+      fs.unlinkSync(filePath);
+      return res.status(400).json({ 
+        error: '.doc 格式暂不支持，请转换为 .docx 后重试',
+        isScanned: true 
+      });
+    } else if (['.pdf', '.jpg', '.jpeg', '.png'].includes(fileExt)) {
+      // PDF 和图片返回提示，建议手动粘贴
+      fs.unlinkSync(filePath);
+      return res.status(400).json({ 
+        error: 'PDF 和图片暂不支持自动解析，请手动粘贴简历内容',
+        isScanned: true 
+      });
+    } else {
+      // 尝试作为文本文件读取
+      try {
+        text = fs.readFileSync(filePath, 'utf-8');
+      } catch (readError) {
+        fs.unlinkSync(filePath);
+        return res.status(400).json({ error: '不支持的文件格式' });
+      }
+    }
+
+    // 清理上传的文件
+    fs.unlinkSync(filePath);
+
+    // 返回解析结果
+    res.json({
+      data: {
+        text: text.trim(),
+        fileName: fileName,
+        type: fileExt.replace('.', ''),
+        isScanned: isScanned,
+        pages: 1 // Word 文档页数难以准确获取，先返回 1
+      }
+    });
+  } catch (error) {
+    console.error('[解析简历失败]', error);
+    // 确保清理文件
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    res.status(500).json({ error: '解析失败: ' + (error.message || '未知错误') });
+  }
+});
+
 app.post('/api/ai/chat', authenticateToken, async (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -481,7 +713,7 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
       // 没有工具调用，说明是最终回复，改用流式输出
       if (toolCalls.length === 0) {
         // 重新发起流式请求
-        conversation.pop(); // 移除刚才加的 assistant 消息，重新流式获取
+        conversation.pop(); // 移除刚才添加的 assistant 消息，重新流式获取
         const stream = await callAiChatStream(conversation, aiTools);
         const reader = stream.getReader();
         const decoder = new TextDecoder();
@@ -544,6 +776,159 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== 简历解析 API ====================
+
+/**
+ * 提取 PDF 文本内容
+ * 预留接口，待实现
+ */
+async function extractPdfText(filePath) {
+  // TODO: 实现 PDF 文本提取
+  return {
+    text: '',
+    pages: 0,
+    info: {},
+    message: 'PDF 解析功能开发中'
+  };
+}
+
+/**
+ * 使用 AI 分析简历内容并结构化
+ */
+async function analyzeResumeWithAI(text) {
+  try {
+    const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${AI_API_KEY}`
+      },
+      body: JSON.stringify({
+        model: AI_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: `你是一位专业的简历解析助手。请从简历文本中提取关键信息，并以 JSON 格式返回。
+
+请提取以下字段：
+- name: 姓名
+- education: 教育背景数组（学校、专业、学历、时间）
+- projects: 项目经历数组
+- skills: 技能数组
+- awards: 获奖情况数组
+- research: 科研/论文情况
+
+如果某些信息无法提取，返回空数组或空字符串。只返回 JSON，不要其他说明。`
+          },
+          {
+            role: 'user',
+            content: `请解析以下简历内容：\n\n${text.substring(0, 8000)}` // 限制长度避免超出 token
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 2000
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error('AI 分析请求失败');
+    }
+
+    const data = await response.json();
+    const content = data.choices?.[0]?.message?.content || '{}';
+    
+    // 尝试解析 JSON
+    try {
+      const jsonMatch = content.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.log('AI 返回非 JSON 格式，使用默认结构');
+    }
+    
+    return {};
+  } catch (error) {
+    console.error('AI 分析失败:', error);
+    return {};
+  }
+}
+
+/**
+ * POST /api/parse-resume
+ * 解析简历文件（PDF 或图片）
+ */
+app.post('/api/parse-resume', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: '请上传文件' });
+    }
+
+    const filePath = req.file.path;
+    const fileType = req.file.mimetype;
+    const originalName = req.file.originalname;
+
+    console.log('[简历解析] 开始:', { fileType, originalName, userId: req.userId });
+
+    let result = {
+      text: '',
+      type: '',
+      pages: 0,
+      structured: {},
+      isScanned: false
+    };
+
+    // 处理 PDF 文件
+    if (fileType === 'application/pdf') {
+      result.type = 'pdf';
+      result.message = 'PDF 解析功能开发中，请手动粘贴简历内容';
+    }
+    // 处理图片文件
+    else if (fileType.startsWith('image/')) {
+      result.type = 'image';
+      result.message = '图片解析功能开发中，请手动粘贴简历内容';
+    }
+
+    // 如果有文本内容，使用 AI 进行结构化分析
+    if (result.text && result.text.length > 50) {
+      console.log('[简历解析] 提取文本长度:', result.text.length);
+      result.structured = await analyzeResumeWithAI(result.text);
+    }
+
+    // 清理临时文件
+    fs.unlink(filePath, (err) => {
+      if (err) console.error('删除临时文件失败:', err);
+    });
+
+    console.log('[简历解析] 完成:', { 
+      type: result.type, 
+      isScanned: result.isScanned,
+      textLength: result.text?.length 
+    });
+
+    res.json({
+      success: true,
+      data: result
+    });
+
+  } catch (error) {
+    console.error('[简历解析] 错误:', error);
+    
+    // 清理临时文件
+    if (req.file) {
+      fs.unlink(req.file.path, () => {});
+    }
+    
+    res.status(500).json({ 
+      error: '简历解析失败: ' + error.message 
+    });
+  }
+});
+
+// ==================== 启动服务器 ====================
+
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`简历解析 API: POST http://localhost:${PORT}/api/parse-resume`);
 });
+
