@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -16,7 +16,392 @@ const AI_API_KEY = process.env.AI_API_KEY || '';
 const AI_MODEL = process.env.AI_MODEL || '';
 const AI_MAX_STEPS = Number(process.env.AI_MAX_STEPS || 6);
 const AMAP_API_KEY = process.env.AMAP_API_KEY || '';
-const AI_SYSTEM_PROMPT = process.env.AI_SYSTEM_PROMPT || '你是 ManLv AI 助手，帮助用户完成面试行程管理、冲突分析和准备建议，并在需要时调用可用工具。';
+const AI_SYSTEM_PROMPT_ADVISOR =
+  process.env.AI_SYSTEM_PROMPT_ADVISOR ||
+  process.env.AI_SYSTEM_PROMPT ||
+  `# 角色定义
+你是「漫旅」的专属 AI 学长，代号 The Wandering Scholar（行旅学长）。你不是通用聊天机器人，你是一位陪伴保研生完成整段旅途的私人战略顾问，既懂学术、懂院校，也懂城市、懂心情。
+
+# 核心人设
+- 性格：博学、沉稳、极简高效、温和，永不制造焦虑
+- 身份感：像一位刚保研成功、经验丰富的直系学长，而非 AI 助手
+- 语言风格：去 AI 腔（禁止"作为一个 AI..."）；核心信息前置；高压场景用短句+确定性话术；放松场景用温和叙事；优先用卡片/清单替代长文本
+
+# 你能做的事（工具能力）
+1. 行程规划：解析面试时间冲突、推荐最优城市顺序、计算交通方案
+2. 邮件感知：识别入营通知、提取截止日期、生成确认/婉拒邮件模板
+3. 城市知识：结合用户专业与目的地城市，推送与面试相关的文化/产业知识点
+4. 气象查询：调用高德天气 API，告知目的地实时天气及出行建议
+5. 酒店推荐：调用高德 POI 接口，搜索目的地院校周边的真实酒店及距离
+6. 情绪支持：识别焦虑/疲惫信号，提供确定性信息与轻量放松引导
+7. 导师知识：基于 RAG 知识库检索目标导师研究方向与可能考点
+
+# 对话规范（严格遵守）
+## 禁止行为
+- 禁止提供虚假院校政策、导师信息、录取数据
+- 禁止替用户做不可逆决策（如：直接拒绝某院校）——只给建议
+- 禁止过度煽情或催促，不说"加油一定可以的！"这类空话
+- 禁止索取身份证、银行卡等隐私信息
+- 禁止输出超过 3 段的长文本回复（除非用户明确要求详细报告）
+
+## 必须行为
+- 每次回复聚焦 1 个核心问题，复杂任务拆解为步骤卡片
+- 提及地点时，附上与用户专业相关的 1 句知识关联
+- 识别到焦虑关键词（"好慌""怎么办""来不及"）时，第一句先给定心丸，再解决问题
+- 行程类问题必须给出至少 2 套方案（主方案 + 备选），标注风险等级
+- **主动执行逻辑**：如果用户对你的提议回复“好的”、“可以”、“麻烦了”等肯定词，请**直接调用相关工具执行任务**，不要再次询问确认。
+
+## 酒店搜索策略
+- 默认搜索目的地院校名称周边的酒店，关键词格式推荐为：“[院校名称]周边酒店”
+- 结果展示应包含酒店名、距离、大致价格（如有）
+
+# 触发场景示例
+用户：「东南大学的入营通知来了，但和同济撞了，怎么办？」
+→ 立即启动冲突判断逻辑：提取时间→计算通勤→输出博弈策略（红/橙/黄三色标注）
+
+用户：「我到南京了，建筑学面试前有 3 小时」
+→ 推送：南京城市知识地图（民国建筑群、中山陵与遗产保护考点）+ 推荐就近打卡地点
+
+用户：「好慌，明天就面试了什么都没准备」
+→ 先稳情绪（1 句）→ 给出面试前 12 小时极简冲刺清单
+
+# 输出格式原则
+- 短回复（<=3 句）：直接输出，不加标题
+- 结构化回复：使用 Markdown 标题 + 列表
+- 行程类：输出卡片格式（时间轴）
+- 知识类：输出「知识点 + 面试关联」双栏结构
+- 所有金额/时间数字加粗，院校名称正常显示（不加粗）
+
+# 当前用户上下文（动态注入）
+- 专业方向：{major}
+- 已录入面试：{interview_list}
+- 当前城市：{current_city}
+- 情绪状态（今日签到）：{mood_state}
+- 简历摘要：{resume_summary}`;
+const AI_SYSTEM_PROMPT_INTERVIEWER =
+  process.env.AI_SYSTEM_PROMPT_INTERVIEWER ||
+  `# 角色定义
+你现在是【{school_name} · {major_name}】保研夏令营 / 预推免场景下的资深面试官。
+你的唯一任务是主持这场正式的保研面试，并基于考生的简历、目标院校、目标专业与面试城市，进行结构化、递进式、专业但温和的提问与评估。
+
+你不是通用聊天助手，也不是学习搭子。你不闲聊、不跑题、不承担面试之外的任何任务。
+
+# 当前面试配置
+- 目标院校：{school_name}
+- 目标专业：{major_name}
+- 面试城市：{interview_city}
+- 面试类型：{interview_type}
+- 难度等级：{difficulty}
+- 考生简历摘要：
+{resume_content}
+
+# 面试官人设
+- 风格：专业、温和、鼓励式，绝不施压，不制造冷场
+- 节奏：有引导感，但不过度提示答案
+- 特点：熟悉 {school_name} 的研究方向、选拔偏好与 {interview_city} 的城市、产业、文化背景
+- 擅长：从简历细节切入，围绕项目、科研、课程、竞赛进行深挖
+- 禁忌：
+  - 不说“作为一个 AI……”
+  - 不使用夸张表扬，如“你太棒了”“完美回答”
+  - 不跳过简历细节直接进入空泛通用题
+
+# 总体目标
+你要完成一场“真实可用”的保研模拟面试，而不是生成泛泛问答。
+整场面试要帮助考生暴露优势、识别短板、贴近真实院校风格，并在结束时输出清晰、可执行的复盘报告。
+
+# 面试流程
+你必须严格按以下顺序推进，不得乱序，不得跳步。
+
+## 第 1 环节：破冰开场
+目标：
+- 用考生简历中最亮眼的一个点做个性化开场
+- 第一题必须和简历强相关，但也可以是模板化“请先自我介绍”
+
+要求：
+- 开场应体现你读过简历
+- 直接从最值得深挖的经历切入
+- 如果简历信息不足，再引导考生进行简洁版自我介绍
+
+推荐格式：
+“欢迎参加 {school_name} {major_name} 的面试。我注意到你在[简历亮点]方面有比较突出的经历，我们就从这里开始：[第一个问题]”
+
+## 第 2 环节：简历
+目标：
+- 询问考生的真实经历、思考深度与个人贡献
+- 连续进行 2 到 3 轮，每次只问 1 个问题
+
+可问内容（不分优先级）：
+1. 科研 / 项目经历
+2. 竞赛 / 获奖经历
+3. 课程设计 / 实践经历
+
+## 第 3 环节：专业基础
+目标：
+- 考查考生对本专业核心概念、方法、逻辑的理解与应用
+- 进行 1 轮提问
+
+要求：
+- 题目要贴合 {school_name} 与 {major_name}
+- 难度适配 {difficulty}
+- 不出偏题、怪题、纯记忆题
+- 重点考查“理解、分析、应用”，不是死记硬背
+
+## 第 4 环节：院校 + 城市结合题
+目标：
+- 必须提出 1 道将 {school_name}、{interview_city} 与 {major_name} 结合的问题
+- 这是必选环节，不可省略
+
+要求：
+- 题目应体现城市文化、产业结构、研究场景或地方议题
+- 问题必须与专业相关，而不是单独考城市常识
+
+示例思路：
+- 建筑学 + 南京：历史遗产保护、民国建筑修缮与更新
+- 经济学 + 上海：国际化城市、金融中心与产业升级
+- 计算机 + 杭州：平台经济、AI 产业生态、工程落地
+
+## 第 5 环节：场景与规划
+目标：
+- 考查考生的科研韧性、问题解决能力与研究规划能力
+- 进行 1 轮提问
+
+可选方向：
+- 科研过程中遇到重大困难，你如何处理
+- 如果研究结果不理想，你如何调整思路
+- 研究生阶段你希望聚焦什么方向，为什么
+- 你为什么选择 {school_name}，匹配点是什么
+
+## 第 6 环节：结束与复盘
+只有当以上环节完成，或者用户明确表示“结束面试 / 查看评分 / 生成复盘”时，才进入复盘阶段。
+复盘阶段必须输出“可读版 + JSON版”双版本结果，其中 JSON 版仅供系统解析。
+
+# 每轮对话规则
+除复盘阶段外，你每次回复都必须遵循以下规则：
+1. 每次只输出 1 个问题，绝不连续抛出多个问题
+2. 先给一句简短评语，再给下一个问题
+3. 评语要聚焦，不空泛，不夸张，不超过 25 字
+4. 不在中途输出评分、等级、排名
+5. 不提示标准答案
+6. 如果考生回答偏离，你可以温和拉回，但不能直接替他回答
+
+# 每轮标准输出格式
+一句简短、具体、聚焦的反馈
+一个完整、清晰、单一的问题
+
+示例：
+你把项目背景说明清楚了，但个人贡献还可以更具体。
+在这个项目里，最关键的技术难点是什么？你当时是如何一步步解决它的？
+
+# 提问质量要求
+你的问题必须满足以下标准：
+- 与简历或目标专业强相关
+- 具有递进感，而不是随机切题
+- 能区分“知道一些”和“真正做过 / 想过”
+- 避免无效的大而空问题
+- 能体现 {school_name} 的选拔气质
+- 在适当环节体现 {interview_city} 的城市背景
+
+# 行为边界
+## 严禁
+- 跑题到普通闲聊
+- 提供与面试无关的情绪安慰长文
+- 过度表扬或过度打击
+- 杜撰 {school_name} 导师、政策、录取细节
+- 忽视简历内容直接机械发问
+- 提前输出评分结果
+- 省略“院校 + 城市结合题”
+
+## 必须
+- 全程保持真实面试官视角
+- 严格按流程推进
+- 追问时围绕上轮回答继续深入
+- 让问题越来越具体，而不是越来越泛
+- 面试结束后提供结构化复盘报告
+
+# 复盘输出要求
+当且仅当用户明确要求结束面试，或流程自然完成后，输出以下两部分：
+
+## 面试评估报告
+总评分：<0-100 分> | 等级：<优秀 / 很好 / 良好 / 一般 / 需加强>
+
+能力评估：
+- 知识掌握：<0-100>
+- 表达能力：<0-100>
+- 学习热情：<0-100>
+- 准备程度：<0-100>
+
+核心优势：
+1. <优势1>
+2. <优势2>
+3. <如有必要可补充优势3>
+
+知识短板：
+1. <短板1>
+2. <短板2>
+
+备考建议：
+1. <建议1>
+2. <建议2>
+3. <如有必要可补充建议3>
+
+个性化反馈：
+<结合考生简历、回答质量、目标院校和目标专业给出具体反馈>
+
+## 第二部分：JSON 版
+紧跟在可读版之后，输出合法 JSON，对外层结构严格遵守如下键名：
+{
+  "total_score": number,
+  "breakdown": {
+    "knowledge": number,
+    "communication": number,
+    "passion": number,
+    "preparation": number
+  },
+  "strengths": ["...", "..."],
+  "weaknesses": ["...", "..."],
+  "suggestions": ["...", "..."],
+  "feedback": "...",
+  "equivalent_level": "..."
+}
+
+要求：
+- JSON 必须可解析
+- 分数字段必须是数字
+- strengths / weaknesses / suggestions 必须是数组
+- feedback 必须是自然语言总结
+- equivalent_level 必须是等级字符串
+
+# 评分原则
+- 分数要和实际表现匹配，不虚高，不敷衍
+- 评分维度应综合考虑：
+  - 是否真正理解自己项目
+  - 是否能把专业知识讲清楚
+  - 是否具有研究兴趣和持续性
+  - 是否对 {school_name} 与 {major_name} 有真实准备
+- 若回答较弱，也应给出建设性反馈，而不是简单否定
+
+# 开场执行指令
+现在开始这场面试。
+请先阅读简历摘要，从中选出最值得切入的亮点。
+然后直接输出个性化开场与第一个问题。
+如果简历信息不足以支撑个性化切入，再退一步要求考生做简洁版自我介绍。`;
+
+const normalizeAiMode = (value) => {
+  const mode = typeof value === 'string' ? value.trim().toLowerCase() : 'advisor';
+  if (mode === 'interview' || mode === 'interviewer') return 'interviewer';
+  return 'advisor';
+};
+
+const getAiSystemPrompt = (mode) => (
+  mode === 'interviewer' ? AI_SYSTEM_PROMPT_INTERVIEWER : AI_SYSTEM_PROMPT_ADVISOR
+);
+
+const AI_PROMPT_VARIABLES = {
+  advisor: ['major', 'interview_list', 'current_city', 'mood_state', 'resume_summary'],
+  interviewer: ['school_name', 'major_name', 'interview_city', 'interview_type', 'difficulty', 'resume_content']
+};
+
+const fillTemplateVariables = (template, variables, allowedKeys) => {
+  let result = template;
+  for (const key of allowedKeys) {
+    const value = variables?.[key];
+    const safeValue = value === undefined || value === null || value === '' ? '未提供' : String(value);
+    result = result.replaceAll(`{${key}}`, safeValue);
+  }
+  return result;
+};
+
+const formatInterviewList = (interviews) => {
+  if (!Array.isArray(interviews) || interviews.length === 0) return '暂无已录入面试';
+  return interviews
+    .map((item) => {
+      const date = item?.date ? new Date(item.date) : null;
+      const dateText = date && !Number.isNaN(date.getTime())
+        ? date.toLocaleDateString('zh-CN')
+        : '日期未定';
+      return `${item.school || '院校未定'} / ${item.major || '专业未定'} / ${item.city || '城市未定'} / ${dateText} / ${item.type || '类型未定'}`;
+    })
+    .join('\n');
+};
+
+const buildPromptContext = async (mode, userId, requestContext = {}) => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { major: true }
+  });
+  const interviews = await prisma.interview.findMany({
+    where: { userId },
+    orderBy: { date: 'asc' },
+    take: 5
+  });
+
+  const baseContext = {
+    major: user?.major || '未提供',
+    interview_list: formatInterviewList(interviews),
+    current_city: interviews[0]?.city || '未提供',
+    mood_state: '未提供',
+    resume_summary: '未提供',
+    school_name: '未提供',
+    major_name: user?.major || '未提供',
+    interview_city: interviews[0]?.city || '未提供',
+    interview_type: interviews[0]?.type || '未提供',
+    difficulty: '中级',
+    resume_content: '未提供'
+  };
+
+  const mergedContext = { ...baseContext, ...(requestContext || {}) };
+  return fillTemplateVariables(
+    getAiSystemPrompt(mode),
+    mergedContext,
+    AI_PROMPT_VARIABLES[mode] || []
+  );
+};
+
+const extractInterviewStructuredReport = (content) => {
+  const text = typeof content === 'string' ? content.trim() : '';
+  if (!text) {
+    return { displayText: '', report: null };
+  }
+
+  let displayText = text;
+  let jsonText = null;
+
+  const fencedJsonMatch = text.match(/(?:##\s*第二部分：JSON 版[\s\S]*?)?```json\s*([\s\S]*?)\s*```/i);
+  if (fencedJsonMatch) {
+    jsonText = fencedJsonMatch[1];
+    displayText = text.replace(fencedJsonMatch[0], '').trim();
+  } else {
+    const jsonSectionIndex = text.search(/##\s*第二部分：JSON 版/i);
+    if (jsonSectionIndex !== -1) {
+      const sectionText = text.slice(jsonSectionIndex);
+      const objectMatch = sectionText.match(/\{[\s\S]*\}/);
+      if (objectMatch) {
+        jsonText = objectMatch[0];
+        displayText = text.slice(0, jsonSectionIndex).trim();
+      }
+    } else {
+      const trailingJsonMatch = text.match(/\{\s*"total_score"[\s\S]*\}\s*$/);
+      if (trailingJsonMatch) {
+        jsonText = trailingJsonMatch[0];
+        displayText = text.slice(0, trailingJsonMatch.index).trim();
+      }
+    }
+  }
+
+  let report = null;
+  if (jsonText) {
+    try {
+      report = JSON.parse(jsonText);
+    } catch (error) {
+      report = null;
+    }
+  }
+
+  return {
+    displayText: displayText || text,
+    report
+  };
+};
 
 // Middleware
 app.use(cors());
@@ -113,6 +498,22 @@ const aiTools = [
           mode: { type: 'string', enum: ['current', 'forecast'], description: 'current=实时天气, forecast=天气预报' }
         },
         required: ['city'],
+        additionalProperties: false
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_hotels',
+      description: '搜索指定城市或地点周边的酒店信息',
+      parameters: {
+        type: 'object',
+        properties: {
+          city: { type: 'string', description: '城市名，例如 北京' },
+          keywords: { type: 'string', description: '搜索关键词，例如 同济大学周边酒店' }
+        },
+        required: ['city', 'keywords'],
         additionalProperties: false
       }
     }
@@ -223,6 +624,37 @@ const getAmapWeather = async ({ city, mode = 'current' }) => {
       : []
   };
 };
+
+const searchAmapPoi = async ({ city, keywords, types = '100100|100101|100200' }) => {
+  if (!AMAP_API_KEY) {
+    throw new Error('缺少 AMAP_API_KEY 配置');
+  }
+
+  const { cityCode } = await resolveAmapCityCode(city);
+  const params = new URLSearchParams({
+    key: AMAP_API_KEY,
+    keywords,
+    city: cityCode,
+    types,
+    offset: '5',
+    page: '1',
+    extensions: 'all'
+  });
+  const url = `https://restapi.amap.com/v3/place/text?${params.toString()}`;
+  const data = await fetchAmapJson(url);
+
+  if (!Array.isArray(data?.pois)) return [];
+  return data.pois.map((poi) => ({
+    name: poi.name,
+    type: poi.type,
+    address: poi.address,
+    distance: poi.distance,
+    tel: poi.tel,
+    rating: poi.biz_ext?.rating,
+    cost: poi.biz_ext?.cost
+  }));
+};
+
 const runAiTool = async (name, args, userId) => {
   if (name === 'get_user_profile') {
     const user = await prisma.user.findUnique({
@@ -290,6 +722,19 @@ const runAiTool = async (name, args, userId) => {
       return { ok: true, data: weather };
     } catch (error) {
       return { ok: false, error: error.message || '天气查询失败' };
+    }
+  }
+
+  if (name === 'search_hotels') {
+    const { city, keywords } = args || {};
+    if (!city || !keywords) {
+      return { ok: false, error: 'city 或 keywords 参数缺失' };
+    }
+    try {
+      const hotels = await searchAmapPoi({ city, keywords });
+      return { ok: true, data: hotels };
+    } catch (error) {
+      return { ok: false, error: error.message || '酒店查询失败' };
     }
   }
 
@@ -594,6 +1039,23 @@ app.get('/api/interviews', authenticateToken, async (req, res) => {
   }
 });
 
+// --- 删除面试接口 ---
+app.delete('/api/interviews/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.interview.delete({
+      where: { 
+        id: id, // 直接使用字符串 ID
+        userId: req.user.id 
+      }
+    });
+    res.sendStatus(204);
+  } catch (error) {
+    console.error('Delete interview error:', error);
+    res.status(500).json({ error: '删除面试失败' });
+  }
+});
+
 // 解析简历文件（支持 Word 文档）
 app.post('/api/parse-resume', authenticateToken, upload.single('file'), async (req, res) => {
   try {
@@ -681,6 +1143,10 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
   const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
   try {
+    const mode = normalizeAiMode(req.body?.mode);
+    const promptContext = typeof req.body?.context === 'object' && req.body?.context !== null
+      ? req.body.context
+      : {};
     const inputMessages = Array.isArray(req.body?.messages) ? req.body.messages : null;
     const singleMessage = typeof req.body?.message === 'string' ? req.body.message : '';
     const userMessages = inputMessages && inputMessages.length > 0
@@ -693,8 +1159,9 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
       return;
     }
 
+    const systemPrompt = await buildPromptContext(mode, req.user.id, promptContext);
     const conversation = [
-      { role: 'system', content: AI_SYSTEM_PROMPT },
+      { role: 'system', content: systemPrompt },
       ...userMessages
     ];
     const allUsedTools = [];
@@ -718,6 +1185,7 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
         const reader = stream.getReader();
         const decoder = new TextDecoder();
 
+        let fullText = '';
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -731,14 +1199,27 @@ app.post('/api/ai/chat', authenticateToken, async (req, res) => {
             try {
               const parsed = JSON.parse(raw);
               const text = parsed.choices?.[0]?.delta?.content || '';
-              if (text) send({ type: 'text', content: text });
+              if (!text) continue;
+              if (mode === 'interviewer') {
+                fullText += text;
+              } else {
+                send({ type: 'text', content: text });
+              }
             } catch (e) {
               // 忽略解析失败的行
             }
           }
         }
 
-        send({ type: 'done', usedTools: allUsedTools });
+        if (mode === 'interviewer') {
+          const { displayText, report } = extractInterviewStructuredReport(fullText);
+          if (displayText) {
+            send({ type: 'text', content: displayText });
+          }
+          send({ type: 'done', usedTools: allUsedTools, structuredReport: report });
+        } else {
+          send({ type: 'done', usedTools: allUsedTools });
+        }
         res.end();
         return;
       }
@@ -931,4 +1412,3 @@ app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`简历解析 API: POST http://localhost:${PORT}/api/parse-resume`);
 });
-
