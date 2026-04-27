@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -63,6 +63,7 @@ const AI_SYSTEM_PROMPT_ADVISOR =
 - 当用户询问飞书/云文档/知识库/云盘文件时，优先调用 \`lark_auth_status\` 检查登录状态；若状态异常，再调用 \`lark_auth_login_start\` 或明确提示用户刷新登录。
 - 在联网搜索后，应整合搜索结果，给出结构化、可操作的建议。
 - **必须在回复中包含来源链接**：使用 Markdown 格式（如 [来源标题](URL)）在相关信息末尾或文末列出参考资料链接，确保用户可以点击跳转到原网页核实。
+- **链接约束**：只有联网搜索结果或工具明确返回 URL 时，才允许输出链接。对于飞书日程、飞书文档等内部对象，若工具返回中没有 URL，禁止自行猜测、拼接或编造链接。
 - 行程类问题必须给出至少 2 套方案（主方案 + 备选），标注风险等级
 - **主动执行逻辑**：如果用户对你的提议回复“好的”、“可以”、“麻烦了”等肯定词，请**直接调用相关工具执行任务**，不要再次询问确认。
 

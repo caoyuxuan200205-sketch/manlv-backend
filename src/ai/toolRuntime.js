@@ -176,6 +176,97 @@ const createToolRuntime = ({
     {
       type: 'function',
       function: {
+        name: 'lark_docs_create',
+        description: '通过飞书官方 lark-cli 创建飞书文档。默认使用 XML 格式；若用户明确要求 Markdown，可传 docFormat=markdown。content 需要传完整文档内容，XML 建议包含 <title> 标题</title>。',
+        parameters: {
+          type: 'object',
+          properties: {
+            content: { type: 'string', description: '文档内容。XML 示例：<title>标题</title><p>正文</p>' },
+            docFormat: { type: 'string', enum: ['xml', 'markdown'], description: '内容格式，默认 xml' },
+            apiVersion: { type: 'string', description: '默认 v2' },
+            parentToken: { type: 'string', description: '父文件夹或知识库节点 token' },
+            parentPosition: { type: 'string', description: '父节点位置，如 my_library；与 parentToken 二选一' }
+          },
+          required: ['content'],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'lark_docs_update',
+        description: '通过飞书官方 lark-cli 更新已有飞书文档。支持 append、overwrite、str_replace、block_insert_after、block_replace、block_delete、block_copy_insert_after、block_move_after。',
+        parameters: {
+          type: 'object',
+          properties: {
+            doc: { type: 'string', description: '飞书文档 URL 或 token' },
+            command: {
+              type: 'string',
+              enum: ['append', 'overwrite', 'str_replace', 'block_insert_after', 'block_replace', 'block_delete', 'block_copy_insert_after', 'block_move_after'],
+              description: '更新指令'
+            },
+            content: { type: 'string', description: '新内容。append/overwrite/replace 等命令常用' },
+            docFormat: { type: 'string', enum: ['xml', 'markdown'], description: '内容格式，默认 xml' },
+            apiVersion: { type: 'string', description: '默认 v2' },
+            pattern: { type: 'string', description: 'str_replace 时使用的匹配文本或模式' },
+            blockId: { type: 'string', description: 'block 级操作使用的目标 block id；传 -1 表示文末' },
+            srcBlockIds: { type: 'string', description: 'block_copy_insert_after / block_move_after 时使用，多个 block id 用逗号分隔' },
+            revisionId: { type: 'integer', description: '基准 revision，默认最新' }
+          },
+          required: ['doc', 'command'],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'lark_calendar_agenda',
+        description: '通过飞书官方 lark-cli 查询日程安排。适合查询今天、明天、本周或给定时间范围内的飞书日程。',
+        parameters: {
+          type: 'object',
+          properties: {
+            start: { type: 'string', description: '开始时间，支持 ISO 8601 或仅日期，如 2026-04-28 或 2026-04-28T09:00:00+08:00' },
+            end: { type: 'string', description: '结束时间，支持 ISO 8601 或仅日期；不传时默认与 start 同一天结束' },
+            calendarId: { type: 'string', description: '日历 ID，默认 primary' },
+            format: { type: 'string', enum: ['json', 'pretty', 'table', 'ndjson', 'csv'], description: '默认 json' }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'lark_calendar_create',
+        description: '通过飞书官方 lark-cli 创建飞书日程。仅在用户明确要求创建/预约日程时使用；start 和 end 必须是明确时间，建议使用 ISO 8601。',
+        parameters: {
+          type: 'object',
+          properties: {
+            summary: { type: 'string', description: '日程标题，尽量只保留主题，不要混入时间地点人物' },
+            start: { type: 'string', description: '开始时间，必须为明确时间，推荐 ISO 8601，如 2026-04-28T14:00:00+08:00' },
+            end: { type: 'string', description: '结束时间，必须为明确时间，推荐 ISO 8601' },
+            description: { type: 'string', description: '日程说明、议程或备注' },
+            attendeeIds: {
+              oneOf: [
+                { type: 'string' },
+                { type: 'array', items: { type: 'string' } }
+              ],
+              description: '参与人 ID，可传逗号分隔字符串或数组；支持用户 ou_、群 oc_、会议室 omm_'
+            },
+            calendarId: { type: 'string', description: '日历 ID，默认 primary' },
+            rrule: { type: 'string', description: '重复规则，遵循 RFC5545；不要使用 COUNT' },
+            dryRun: { type: 'boolean', description: '仅预览请求，不实际创建' }
+          },
+          required: ['start', 'end'],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'lark_drive_list_files',
         description: '通过飞书官方 lark-cli 列出云空间文件。folderToken 为空时列出根目录。',
         parameters: {
@@ -482,6 +573,86 @@ const createToolRuntime = ({
     if (name === 'lark_docs_fetch') {
       const { doc, apiVersion = 'v2', limit, offset } = args || {};
       return larkCliRuntime.fetchDoc({ doc, apiVersion, limit, offset });
+    }
+
+    if (name === 'lark_docs_create') {
+      const {
+        content,
+        docFormat = 'xml',
+        apiVersion = 'v2',
+        parentToken,
+        parentPosition
+      } = args || {};
+      return larkCliRuntime.createDoc({
+        content,
+        docFormat,
+        apiVersion,
+        parentToken,
+        parentPosition
+      });
+    }
+
+    if (name === 'lark_docs_update') {
+      const {
+        doc,
+        command,
+        content,
+        docFormat = 'xml',
+        apiVersion = 'v2',
+        pattern,
+        blockId,
+        srcBlockIds,
+        revisionId
+      } = args || {};
+      return larkCliRuntime.updateDoc({
+        doc,
+        command,
+        content,
+        docFormat,
+        apiVersion,
+        pattern,
+        blockId,
+        srcBlockIds,
+        revisionId
+      });
+    }
+
+    if (name === 'lark_calendar_agenda') {
+      const {
+        start,
+        end,
+        calendarId = 'primary',
+        format = 'json'
+      } = args || {};
+      return larkCliRuntime.getCalendarAgenda({
+        start,
+        end,
+        calendarId,
+        format
+      });
+    }
+
+    if (name === 'lark_calendar_create') {
+      const {
+        summary,
+        start,
+        end,
+        description,
+        attendeeIds,
+        calendarId = 'primary',
+        rrule,
+        dryRun = false
+      } = args || {};
+      return larkCliRuntime.createCalendarEvent({
+        summary,
+        start,
+        end,
+        description,
+        attendeeIds,
+        calendarId,
+        rrule,
+        dryRun
+      });
     }
 
     if (name === 'lark_drive_list_files') {

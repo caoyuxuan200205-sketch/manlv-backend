@@ -102,9 +102,13 @@ const createAiAgentGraph = ({
 
       if (typeof state.sendEvent === 'function') {
         state.sendEvent({ type: 'thinking', tool: name });
+        state.sendEvent({ type: 'tool_start', tool: name });
       }
 
       const result = await runAiTool(name, parsedArgs, state.userId);
+      if (typeof state.sendEvent === 'function') {
+        state.sendEvent({ type: 'tool_result', tool: name, ok: result.ok });
+      }
       usedTools.push({ name, ok: result.ok });
       toolMessages.push({
         role: 'tool',

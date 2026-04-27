@@ -185,6 +185,220 @@ const createLarkCliRuntime = ({
     };
   });
 
+  const createDoc = async ({
+    content,
+    docFormat = 'xml',
+    apiVersion = 'v2',
+    parentToken,
+    parentPosition
+  } = {}) => withAuthContext(async () => {
+    if (!content || typeof content !== 'string') {
+      return { ok: false, error: 'content 参数缺失或格式错误' };
+    }
+    if (parentToken && parentPosition) {
+      return { ok: false, error: 'parentToken 与 parentPosition 不能同时传入' };
+    }
+
+    const args = [
+      'docs',
+      '+create',
+      '--as', 'user',
+      '--api-version', String(apiVersion),
+      '--content', String(content)
+    ];
+
+    if (docFormat) args.push('--doc-format', String(docFormat));
+    if (parentToken) args.push('--parent-token', String(parentToken));
+    if (parentPosition) args.push('--parent-position', String(parentPosition));
+
+    const result = await runCli(args, { json: true, timeoutMs: 45000 });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.stderr || result.stdout || result.error || '创建飞书文档失败',
+        stdout: result.stdout,
+        stderr: result.stderr
+      };
+    }
+
+    return {
+      ok: true,
+      data: result.data
+    };
+  });
+
+  const updateDoc = async ({
+    doc,
+    command,
+    content,
+    docFormat = 'xml',
+    apiVersion = 'v2',
+    pattern,
+    blockId,
+    srcBlockIds,
+    revisionId
+  } = {}) => withAuthContext(async () => {
+    if (!doc || typeof doc !== 'string') {
+      return { ok: false, error: 'doc 参数缺失或格式错误' };
+    }
+    if (!command || typeof command !== 'string') {
+      return { ok: false, error: 'command 参数缺失或格式错误' };
+    }
+
+    const args = [
+      'docs',
+      '+update',
+      '--as', 'user',
+      '--api-version', String(apiVersion),
+      '--doc', String(doc),
+      '--command', String(command)
+    ];
+
+    if (docFormat) args.push('--doc-format', String(docFormat));
+    if (content !== undefined) args.push('--content', String(content));
+    if (pattern !== undefined) args.push('--pattern', String(pattern));
+    if (blockId !== undefined) args.push('--block-id', String(blockId));
+    if (srcBlockIds !== undefined) args.push('--src-block-ids', String(srcBlockIds));
+    if (revisionId !== undefined) args.push('--revision-id', String(revisionId));
+
+    const result = await runCli(args, { json: true, timeoutMs: 45000 });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.stderr || result.stdout || result.error || '更新飞书文档失败',
+        stdout: result.stdout,
+        stderr: result.stderr
+      };
+    }
+
+    return {
+      ok: true,
+      data: result.data
+    };
+  });
+
+  const getCalendarAgenda = async ({
+    start,
+    end,
+    calendarId = 'primary',
+    format = 'json'
+  } = {}) => withAuthContext(async () => {
+    const args = [
+      'calendar',
+      '+agenda',
+      '--as', 'user',
+      '--calendar-id', String(calendarId),
+      '--format', String(format)
+    ];
+
+    if (start) args.push('--start', String(start));
+    if (end) args.push('--end', String(end));
+
+    const result = await runCli(args, { json: format === 'json', timeoutMs: 45000 });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.stderr || result.stdout || result.error || '查询飞书日程失败',
+        stdout: result.stdout,
+        stderr: result.stderr
+      };
+    }
+
+    return {
+      ok: true,
+      data: result.data
+    };
+  });
+
+  const findCreatedCalendarEvent = async ({
+    eventId,
+    start,
+    end,
+    calendarId = 'primary'
+  } = {}) => {
+    if (!eventId || !start || !end) return null;
+
+    const agendaResult = await getCalendarAgenda({
+      start: String(start).slice(0, 10),
+      end: String(end).slice(0, 10),
+      calendarId,
+      format: 'json'
+    });
+    if (!agendaResult?.ok) return null;
+
+    const events = Array.isArray(agendaResult?.data?.data) ? agendaResult.data.data : [];
+    return events.find((item) => item?.event_id === eventId) || null;
+  };
+
+  const createCalendarEvent = async ({
+    summary,
+    start,
+    end,
+    description,
+    attendeeIds,
+    calendarId = 'primary',
+    rrule,
+    dryRun = false
+  } = {}) => withAuthContext(async () => {
+    if (!start || typeof start !== 'string') {
+      return { ok: false, error: 'start 参数缺失或格式错误' };
+    }
+    if (!end || typeof end !== 'string') {
+      return { ok: false, error: 'end 参数缺失或格式错误' };
+    }
+
+    const args = [
+      'calendar',
+      '+create',
+      '--as', 'user',
+      '--calendar-id', String(calendarId),
+      '--start', String(start),
+      '--end', String(end)
+    ];
+
+    if (summary) args.push('--summary', String(summary));
+    if (description) args.push('--description', String(description));
+    if (Array.isArray(attendeeIds) && attendeeIds.length > 0) {
+      args.push('--attendee-ids', attendeeIds.join(','));
+    } else if (typeof attendeeIds === 'string' && attendeeIds.trim()) {
+      args.push('--attendee-ids', attendeeIds.trim());
+    }
+    if (rrule) args.push('--rrule', String(rrule));
+    if (dryRun) args.push('--dry-run');
+
+    const result = await runCli(args, { json: true, timeoutMs: 45000 });
+    if (!result.ok) {
+      return {
+        ok: false,
+        error: result.stderr || result.stdout || result.error || '创建飞书日程失败',
+        stdout: result.stdout,
+        stderr: result.stderr
+      };
+    }
+
+    const createdEventId = result?.data?.data?.event_id;
+    const matchedEvent = await findCreatedCalendarEvent({
+      eventId: createdEventId,
+      start,
+      end,
+      calendarId
+    });
+
+    if (matchedEvent && result?.data?.data) {
+      result.data.data = {
+        ...result.data.data,
+        app_link: matchedEvent.app_link || null,
+        organizer_calendar_id: matchedEvent.organizer_calendar_id || null,
+        vchat: matchedEvent.vchat || null
+      };
+    }
+
+    return {
+      ok: true,
+      data: result.data
+    };
+  });
+
   const listDriveFiles = async ({
     folderToken = '',
     orderBy = 'EditedTime',
@@ -235,6 +449,10 @@ const createLarkCliRuntime = ({
     startAuthLogin,
     searchDocs,
     fetchDoc,
+    createDoc,
+    updateDoc,
+    getCalendarAgenda,
+    createCalendarEvent,
     listDriveFiles
   };
 };
