@@ -87,10 +87,35 @@ AI_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 AI_API_KEY=sk-xxxxxxxxxxxxxxxx
 AI_MODEL=qwen-plus
 AI_MAX_STEPS=6
+TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
+MCP_SERVERS_JSON=[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","C:\\\\Users\\\\24203\\\\Desktop\\\\ManLv"]}]
 
 # AI 系统提示词（可选，有默认值）
 AI_SYSTEM_PROMPT=你是漫旅 AI 助手。你的目标是帮助用户完成保研行程管理、冲突分析、面试准备，并在需要时调用可用工具。请先思考，再给出简洁、可执行的建议。
 ```
+
+`MCP_SERVERS_JSON` 为可选配置，用于挂载一个或多个 MCP Server。格式为 JSON 数组，每个元素支持以下字段：
+
+```json
+[
+  {
+    "name": "filesystem",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\24203\\Desktop\\ManLv"],
+    "cwd": "C:\\Users\\24203\\Desktop\\manlv-backend",
+    "env": {
+      "EXAMPLE_KEY": "example-value"
+    }
+  }
+]
+```
+
+说明：
+- `name`：MCP Server 的标识名，会用于生成工具前缀。
+- `command` / `args`：启动 MCP Server 的命令。
+- `cwd`：可选，MCP Server 的工作目录。
+- `env`：可选，启动 MCP Server 时附加的环境变量。
+- Windows 路径放进 JSON 时请使用双反斜杠，如 `C:\\Users\\...`。
 
 **AI 模型选择参考：**
 
@@ -184,6 +209,18 @@ Authorization: Bearer <token>
 | `list_interviews` | 查询用户面试安排列表 |
 | `create_interview` | 创建新的面试记录 |
 | `analyze_schedule_conflicts` | 分析同日行程冲突 |
+| `web_search` | 联网搜索最新保研资讯与动态 |
+
+### MCP 扩展工具
+
+后端现已支持通过 MCP 动态挂载外部工具：
+
+- 启动时读取 `MCP_SERVERS_JSON`
+- 通过 `stdio` 连接 MCP Server
+- 自动发现该 Server 暴露的 tools
+- 将这些 tools 映射进现有的 AI Function Calling 流程
+
+映射后的工具名会自动转换为类似 `mcp_filesystem_read_file` 的安全名称，供模型调用。
 
 ### Agent 工作流程
 

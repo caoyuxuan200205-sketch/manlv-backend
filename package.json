@@ -18,6 +18,12 @@
     "@alicloud/openapi-client": "^0.4.15",
     "@alicloud/openapi-core": "^1.0.7",
     "@baiducloud/sdk": "^1.0.7",
+    "@langchain/core": "^1.1.41",
+    "@langchain/langgraph": "^1.2.9",
+    "@langchain/openai": "^1.4.4",
+    "@larksuite/cli": "^1.0.19",
+    "@larksuiteoapi/node-sdk": "^1.62.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
     "@prisma/client": "^6.19.2",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
@@ -29,6 +35,7 @@
     "nodemon": "^3.1.14",
     "pdf-parse": "^2.4.5",
     "pdf2image": "^1.2.3",
-    "prisma": "^6.19.2"
+    "prisma": "^6.19.2",
+    "zod": "^4.3.6"
   }
 }

@@ -9,16 +9,20 @@ datasource db {
 }
 
 model User {
-  id         String      @id @default(cuid())
-  email      String      @unique
-  password   String
-  name       String
-  major      String?     // 专业方向
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
-  emails     Email[]     // 关联的邮件
-  interviews Interview[] // 关联的面试安排
-  tripPlans  TripPlan[]  // 关联的行程规划方案
+  id            String      @id @default(cuid())
+  email         String      @unique
+  password      String
+  name          String
+  major         String?
+  memorySummary String?     @db.Text
+  memoryFacts   Json?
+  mcpServers    Json?
+  mcpEnabled    Boolean     @default(false)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  emails        Email[]
+  interviews    Interview[]
+  tripPlans     TripPlan[]
 }
 
 model Email {
@@ -29,7 +33,7 @@ model Email {
   body       String
   sender     String
   receivedAt DateTime
-  parsedData Json?    
+  parsedData Json?
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 }
@@ -38,11 +42,11 @@ model Interview {
   id        String   @id @default(cuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  school    String   
-  major     String   
-  date      DateTime 
-  city      String   
-  type      String   
+  school    String
+  major     String
+  date      DateTime
+  city      String
+  type      String
   createdAt DateTime @default(now())
 }
 
@@ -50,13 +54,13 @@ model TripPlan {
   id        String   @id @default(cuid())
   userId    String
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  route     String   
-  cost      String   
-  duration  String   
-  fatigue   String   
-  score     Int      
-  desc      String   
+  route     String
+  cost      String
+  duration  String
+  fatigue   String
+  score     Int
+  desc      String
   recommend Boolean  @default(false)
-  planData  Json     
+  planData  Json
   createdAt DateTime @default(now())
 }

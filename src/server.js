@@ -1,4 +1,4 @@
-﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -6,6 +6,14 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const { Client } = require('@modelcontextprotocol/sdk/client');
+const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
+const { createModelClient } = require('./ai/modelClient');
+const { createAiAgentGraph } = require('./ai/graph');
+const { createToolRuntime } = require('./ai/toolRuntime');
+const { createPromptRuntime } = require('./ai/promptRuntime');
+const { createAiChatHandler } = require('./ai/chatHandler');
+const { createLarkCliRuntime } = require('./ai/larkCliRuntime');
 require('dotenv').config();
 
 const app = express();
@@ -16,6 +24,8 @@ const AI_API_KEY = process.env.AI_API_KEY || '';
 const AI_MODEL = process.env.AI_MODEL || '';
 const AI_MAX_STEPS = Number(process.env.AI_MAX_STEPS || 6);
 const AMAP_API_KEY = process.env.AMAP_API_KEY || '';
+const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
+const MCP_SERVERS_JSON = process.env.MCP_SERVERS_JSON || '';
 const AI_SYSTEM_PROMPT_ADVISOR =
   process.env.AI_SYSTEM_PROMPT_ADVISOR ||
   process.env.AI_SYSTEM_PROMPT ||
@@ -33,12 +43,13 @@ const AI_SYSTEM_PROMPT_ADVISOR =
 3. 城市知识：结合用户专业与目的地城市，推送与面试相关的文化/产业知识点
 4. 气象查询：调用高德天气 API，告知目的地实时天气及出行建议
 5. 酒店推荐：调用高德 POI 接口，搜索目的地院校周边的真实酒店及距离
-6. 情绪支持：识别焦虑/疲惫信号，提供确定性信息与轻量放松引导
-7. 导师知识：基于 RAG 知识库检索目标导师研究方向与可能考点
+6. 联网搜索：通过 Tavily 搜索最新的保研政策、院校夏令营/预推免通知、导师动态及笔面试真题
+7. 情绪支持：识别焦虑/疲惫信号，提供确定性信息与轻量放松引导
+8. 导师知识：基于 RAG 知识库或联网搜索检索目标导师研究方向与可能考点
 
 # 对话规范（严格遵守）
 ## 禁止行为
-- 禁止提供虚假院校政策、导师信息、录取数据
+- 禁止提供虚假院校政策、导师信息、录取数据。如果不确定，必须调用 \`web_search\` 工具查询最新信息。
 - 禁止替用户做不可逆决策（如：直接拒绝某院校）——只给建议
 - 禁止过度煽情或催促，不说"加油一定可以的！"这类空话
 - 禁止索取身份证、银行卡等隐私信息
@@ -48,6 +59,10 @@ const AI_SYSTEM_PROMPT_ADVISOR =
 - 每次回复聚焦 1 个核心问题，复杂任务拆解为步骤卡片
 - 提及地点时，附上与用户专业相关的 1 句知识关联
 - 识别到焦虑关键词（"好慌""怎么办""来不及"）时，第一句先给定心丸，再解决问题
+- 当用户询问具体的院校动态、截止日期、导师近况或需要最新资讯时，优先调用 \`web_search\`。
+- 当用户询问飞书/云文档/知识库/云盘文件时，优先调用 \`lark_auth_status\` 检查登录状态；若状态异常，再调用 \`lark_auth_login_start\` 或明确提示用户刷新登录。
+- 在联网搜索后，应整合搜索结果，给出结构化、可操作的建议。
+- **必须在回复中包含来源链接**：使用 Markdown 格式（如 [来源标题](URL)）在相关信息末尾或文末列出参考资料链接，确保用户可以点击跳转到原网页核实。
 - 行程类问题必须给出至少 2 套方案（主方案 + 备选），标注风险等级
 - **主动执行逻辑**：如果用户对你的提议回复“好的”、“可以”、“麻烦了”等肯定词，请**直接调用相关工具执行任务**，不要再次询问确认。
 
@@ -71,6 +86,9 @@ const AI_SYSTEM_PROMPT_ADVISOR =
 - 行程类：输出卡片格式（时间轴）
 - 知识类：输出「知识点 + 面试关联」双栏结构
 - 所有金额/时间数字加粗，院校名称正常显示（不加粗）
+- 当回复包含代码、Prisma Schema、SQL、JSON、HTTP 接口示例、命令行或配置片段时，必须使用 Markdown fenced code block，禁止把多行代码写成普通段落或拆成多个行内 code
+- 代码块必须尽量标注语言类型，例如 \`\`\`prisma、\`\`\`js、\`\`\`json、\`\`\`http、\`\`\`bash
+- 行内 code 只用于短标识符、字段名、路径名或命令名；超过 1 行的内容一律使用 fenced code block
 
 # 当前用户上下文（动态注入）
 - 专业方向：{major}
@@ -270,6 +288,8 @@ const AI_SYSTEM_PROMPT_INTERVIEWER =
 - strengths / weaknesses / suggestions 必须是数组
 - feedback 必须是自然语言总结
 - equivalent_level 必须是等级字符串
+- 第二部分 JSON 版必须放在 \`\`\`json fenced code block\`\`\` 中输出，除这段 JSON 外不要在代码块里混入额外说明
+- 如果回答中包含代码、配置、接口示例或结构化片段，也必须使用 fenced code block，禁止输出成普通段落
 
 # 评分原则
 - 分数要和实际表现匹配，不虚高，不敷衍
@@ -285,123 +305,6 @@ const AI_SYSTEM_PROMPT_INTERVIEWER =
 请先阅读简历摘要，从中选出最值得切入的亮点。
 然后直接输出个性化开场与第一个问题。
 如果简历信息不足以支撑个性化切入，再退一步要求考生做简洁版自我介绍。`;
-
-const normalizeAiMode = (value) => {
-  const mode = typeof value === 'string' ? value.trim().toLowerCase() : 'advisor';
-  if (mode === 'interview' || mode === 'interviewer') return 'interviewer';
-  return 'advisor';
-};
-
-const getAiSystemPrompt = (mode) => (
-  mode === 'interviewer' ? AI_SYSTEM_PROMPT_INTERVIEWER : AI_SYSTEM_PROMPT_ADVISOR
-);
-
-const AI_PROMPT_VARIABLES = {
-  advisor: ['major', 'interview_list', 'current_city', 'mood_state', 'resume_summary'],
-  interviewer: ['school_name', 'major_name', 'interview_city', 'interview_type', 'difficulty', 'resume_content']
-};
-
-const fillTemplateVariables = (template, variables, allowedKeys) => {
-  let result = template;
-  for (const key of allowedKeys) {
-    const value = variables?.[key];
-    const safeValue = value === undefined || value === null || value === '' ? '未提供' : String(value);
-    result = result.replaceAll(`{${key}}`, safeValue);
-  }
-  return result;
-};
-
-const formatInterviewList = (interviews) => {
-  if (!Array.isArray(interviews) || interviews.length === 0) return '暂无已录入面试';
-  return interviews
-    .map((item) => {
-      const date = item?.date ? new Date(item.date) : null;
-      const dateText = date && !Number.isNaN(date.getTime())
-        ? date.toLocaleDateString('zh-CN')
-        : '日期未定';
-      return `${item.school || '院校未定'} / ${item.major || '专业未定'} / ${item.city || '城市未定'} / ${dateText} / ${item.type || '类型未定'}`;
-    })
-    .join('\n');
-};
-
-const buildPromptContext = async (mode, userId, requestContext = {}) => {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: { major: true }
-  });
-  const interviews = await prisma.interview.findMany({
-    where: { userId },
-    orderBy: { date: 'asc' },
-    take: 5
-  });
-
-  const baseContext = {
-    major: user?.major || '未提供',
-    interview_list: formatInterviewList(interviews),
-    current_city: interviews[0]?.city || '未提供',
-    mood_state: '未提供',
-    resume_summary: '未提供',
-    school_name: '未提供',
-    major_name: user?.major || '未提供',
-    interview_city: interviews[0]?.city || '未提供',
-    interview_type: interviews[0]?.type || '未提供',
-    difficulty: '中级',
-    resume_content: '未提供'
-  };
-
-  const mergedContext = { ...baseContext, ...(requestContext || {}) };
-  return fillTemplateVariables(
-    getAiSystemPrompt(mode),
-    mergedContext,
-    AI_PROMPT_VARIABLES[mode] || []
-  );
-};
-
-const extractInterviewStructuredReport = (content) => {
-  const text = typeof content === 'string' ? content.trim() : '';
-  if (!text) {
-    return { displayText: '', report: null };
-  }
-
-  let displayText = text;
-  let jsonText = null;
-
-  const fencedJsonMatch = text.match(/(?:##\s*第二部分：JSON 版[\s\S]*?)?```json\s*([\s\S]*?)\s*```/i);
-  if (fencedJsonMatch) {
-    jsonText = fencedJsonMatch[1];
-    displayText = text.replace(fencedJsonMatch[0], '').trim();
-  } else {
-    const jsonSectionIndex = text.search(/##\s*第二部分：JSON 版/i);
-    if (jsonSectionIndex !== -1) {
-      const sectionText = text.slice(jsonSectionIndex);
-      const objectMatch = sectionText.match(/\{[\s\S]*\}/);
-      if (objectMatch) {
-        jsonText = objectMatch[0];
-        displayText = text.slice(0, jsonSectionIndex).trim();
-      }
-    } else {
-      const trailingJsonMatch = text.match(/\{\s*"total_score"[\s\S]*\}\s*$/);
-      if (trailingJsonMatch) {
-        jsonText = trailingJsonMatch[0];
-        displayText = text.slice(0, trailingJsonMatch.index).trim();
-      }
-    }
-  }
-
-  let report = null;
-  if (jsonText) {
-    try {
-      report = JSON.parse(jsonText);
-    } catch (error) {
-      report = null;
-    }
-  }
-
-  return {
-    displayText: displayText || text,
-    report
-  };
-};
 
 // Middleware
 app.use(cors());
@@ -429,379 +332,497 @@ if (!fs.existsSync('uploads')) {
   fs.mkdirSync('uploads');
 }
 
-const aiTools = [
-  {
-    type: 'function',
-    function: {
-      name: 'get_user_profile',
-      description: '获取当前登录用户的基础资料',
-      parameters: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'list_interviews',
-      description: '获取当前用户的面试安排列表',
-      parameters: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'create_interview',
-      description: '创建新的面试安排，date 需为可解析日期字符串',
-      parameters: {
-        type: 'object',
-        properties: {
-          school: { type: 'string' },
-          major: { type: 'string' },
-          date: { type: 'string' },
-          city: { type: 'string' },
-          type: { type: 'string' }
-        },
-        required: ['school', 'major', 'date', 'city', 'type'],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'analyze_schedule_conflicts',
-      description: '分析用户面试安排中同一天是否存在冲突并返回冲突清单',
-      parameters: {
-        type: 'object',
-        properties: {},
-        additionalProperties: false
-      }
-    }
-  }
-  ,
-  {
-    type: 'function',
-    function: {
-      name: 'get_weather',
-      description: '查询指定城市的天气信息，支持实时天气或未来预报',
-      parameters: {
-        type: 'object',
-        properties: {
-          city: { type: 'string', description: '城市名、adcode 或 citycode，例如 北京、上海、110000' },
-          mode: { type: 'string', enum: ['current', 'forecast'], description: 'current=实时天气, forecast=天气预报' }
-        },
-        required: ['city'],
-        additionalProperties: false
-      }
-    }
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'search_hotels',
-      description: '搜索指定城市或地点周边的酒店信息',
-      parameters: {
-        type: 'object',
-        properties: {
-          city: { type: 'string', description: '城市名，例如 北京' },
-          keywords: { type: 'string', description: '搜索关键词，例如 同济大学周边酒店' }
-        },
-        required: ['city', 'keywords'],
-        additionalProperties: false
-      }
-    }
-  }
-];
+const parseMcpServerConfigs = () => {
+  console.log('MCP_SERVERS_JSON 值:', MCP_SERVERS_JSON);
+  console.log('MCP_SERVERS_JSON 长度:', MCP_SERVERS_JSON.length);
+  if (!MCP_SERVERS_JSON.trim()) return [];
 
-const toDayKey = (value) => {
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return null;
-  return d.toISOString().slice(0, 10);
-};
-
-
-const fetchAmapJson = async (url) => {
-  const response = await fetch(url);
-  const text = await response.text();
-  let data = {};
   try {
-    data = JSON.parse(text);
-  } catch (e) {
-    throw new Error(`高德接口返回非 JSON: ${text.slice(0, 120)}`);
-  }
+    const parsed = JSON.parse(MCP_SERVERS_JSON);
+    if (!Array.isArray(parsed)) {
+      console.warn('MCP_SERVERS_JSON 必须是数组 JSON，已忽略。');
+      return [];
+    }
 
-  if (!response.ok) {
-    const message = data?.info || text || `HTTP ${response.status}`;
-    throw new Error(`高德接口请求失败: ${message}`);
+    return parsed
+      .map((item, index) => {
+        const name = typeof item?.name === 'string' && item.name.trim()
+          ? item.name.trim()
+          : `server_${index + 1}`;
+        const command = typeof item?.command === 'string' ? item.command.trim() : '';
+        const args = Array.isArray(item?.args) ? item.args.map((arg) => String(arg)) : [];
+        const cwd = typeof item?.cwd === 'string' && item.cwd.trim() ? item.cwd.trim() : undefined;
+        const env = item?.env && typeof item.env === 'object' && !Array.isArray(item.env)
+          ? Object.fromEntries(Object.entries(item.env).map(([key, value]) => [key, String(value)]))
+          : undefined;
+
+        if (!command) {
+          console.warn(`MCP server[${name}] 缺少 command，已跳过。`);
+          return null;
+        }
+
+        // 飞书官方接入改为直接调用 @larksuite/cli，这里跳过旧的 lark-mcp 配置
+        if (
+          name.toLowerCase() === 'feishu' ||
+          args.some((arg) => arg.includes('@larksuiteoapi/lark-mcp'))
+        ) {
+          console.log(`MCP server[${name}] 已切换为官方 @larksuite/cli 接入，跳过旧配置。`);
+          return null;
+        }
+
+        return { name, command, args, cwd, env };
+      })
+      .filter(Boolean);
+  } catch (error) {
+    console.error('解析 MCP_SERVERS_JSON 失败:', error);
+    return [];
   }
-  if (data?.status !== '1') {
-    throw new Error(`高德接口业务失败: ${data?.info || 'unknown error'}`);
-  }
-  return data;
 };
 
-const resolveAmapCityCode = async (cityInput) => {
-  const raw = (cityInput || '').trim();
-  if (!raw) throw new Error('城市参数不能为空');
+const sanitizeToolSegment = (value) => String(value || '')
+  .toLowerCase()
+  .replace(/[^a-z0-9_]+/g, '_')
+  .replace(/^_+|_+$/g, '')
+  .slice(0, 20);
 
-  if (/^\d{6}$/.test(raw)) {
-    return { cityCode: raw, cityName: raw };
+const buildMcpToolAlias = (serverName, toolName, usedNames) => {
+  const serverPart = sanitizeToolSegment(serverName) || 'server';
+  const toolPart = sanitizeToolSegment(toolName) || 'tool';
+  const base = `mcp_${serverPart}_${toolPart}`.slice(0, 64);
+
+  if (!usedNames.has(base)) {
+    usedNames.add(base);
+    return base;
   }
 
-  const params = new URLSearchParams({
-    key: AMAP_API_KEY,
-    keywords: raw,
-    subdistrict: '0',
-    extensions: 'base'
-  });
-  const url = `https://restapi.amap.com/v3/config/district?${params.toString()}`;
-  const data = await fetchAmapJson(url);
-  const first = Array.isArray(data?.districts) ? data.districts[0] : null;
-  if (!first?.adcode) {
-    throw new Error(`未找到城市: ${raw}`);
+  let suffix = 2;
+  while (suffix < 1000) {
+    const candidate = `${base.slice(0, Math.max(1, 64 - String(suffix).length - 1))}_${suffix}`;
+    if (!usedNames.has(candidate)) {
+      usedNames.add(candidate);
+      return candidate;
+    }
+    suffix += 1;
   }
-  return { cityCode: first.adcode, cityName: first.name || raw };
+
+  throw new Error(`无法为 MCP 工具生成唯一名称: ${serverName}/${toolName}`);
 };
 
-const getAmapWeather = async ({ city, mode = 'current' }) => {
-  if (!AMAP_API_KEY) {
-    throw new Error('缺少 AMAP_API_KEY 配置');
-  }
-
-  const weatherMode = mode === 'forecast' ? 'all' : 'base';
-  const { cityCode, cityName } = await resolveAmapCityCode(city);
-  const params = new URLSearchParams({
-    key: AMAP_API_KEY,
-    city: cityCode,
-    extensions: weatherMode
-  });
-  const url = `https://restapi.amap.com/v3/weather/weatherInfo?${params.toString()}`;
-  const data = await fetchAmapJson(url);
-
-  if (weatherMode === 'base') {
-    const live = Array.isArray(data?.lives) ? data.lives[0] : null;
-    if (!live) throw new Error('未获取到实时天气');
+const normalizeToolSchema = (schema) => {
+  if (schema && typeof schema === 'object' && !Array.isArray(schema)) {
+    if (schema.type === 'object') {
+      return schema;
+    }
     return {
-      type: 'current',
-      city: live.city || cityName,
-      adcode: live.adcode || cityCode,
-      weather: live.weather,
-      temperature: live.temperature,
-      windDirection: live.winddirection,
-      windPower: live.windpower,
-      humidity: live.humidity,
-      reportTime: live.reporttime
+      type: 'object',
+      properties: {},
+      additionalProperties: true
     };
   }
 
-  const forecast = Array.isArray(data?.forecasts) ? data.forecasts[0] : null;
-  if (!forecast) throw new Error('未获取到天气预报');
   return {
-    type: 'forecast',
-    city: forecast.city || cityName,
-    adcode: forecast.adcode || cityCode,
-    reportTime: forecast.reporttime,
-    casts: Array.isArray(forecast.casts)
-      ? forecast.casts.map((item) => ({
-          date: item.date,
-          week: item.week,
-          dayWeather: item.dayweather,
-          nightWeather: item.nightweather,
-          dayTemp: item.daytemp,
-          nightTemp: item.nighttemp,
-          dayWind: item.daywind,
-          nightWind: item.nightwind,
-          dayPower: item.daypower,
-          nightPower: item.nightpower
-        }))
-      : []
+    type: 'object',
+    properties: {},
+    additionalProperties: true
   };
 };
 
-const searchAmapPoi = async ({ city, keywords, types = '100100|100101|100200' }) => {
-  if (!AMAP_API_KEY) {
-    throw new Error('缺少 AMAP_API_KEY 配置');
-  }
+const formatMcpToolContent = (result) => {
+  if (!Array.isArray(result?.content)) return '';
 
-  const { cityCode } = await resolveAmapCityCode(city);
-  const params = new URLSearchParams({
-    key: AMAP_API_KEY,
-    keywords,
-    city: cityCode,
-    types,
-    offset: '5',
-    page: '1',
-    extensions: 'all'
-  });
-  const url = `https://restapi.amap.com/v3/place/text?${params.toString()}`;
-  const data = await fetchAmapJson(url);
-
-  if (!Array.isArray(data?.pois)) return [];
-  return data.pois.map((poi) => ({
-    name: poi.name,
-    type: poi.type,
-    address: poi.address,
-    distance: poi.distance,
-    tel: poi.tel,
-    rating: poi.biz_ext?.rating,
-    cost: poi.biz_ext?.cost
-  }));
-};
-
-const runAiTool = async (name, args, userId) => {
-  if (name === 'get_user_profile') {
-    const user = await prisma.user.findUnique({
-      where: { id: userId },
-      select: { id: true, email: true, name: true, major: true }
-    });
-    return { ok: true, data: user };
-  }
-
-  if (name === 'list_interviews') {
-    const interviews = await prisma.interview.findMany({
-      where: { userId },
-      orderBy: { date: 'asc' }
-    });
-    return { ok: true, data: interviews };
-  }
-
-  if (name === 'create_interview') {
-    const { school, major, date, city, type } = args || {};
-    const parsedDate = new Date(date);
-    if (!school || !major || !city || !type || Number.isNaN(parsedDate.getTime())) {
-      return { ok: false, error: '参数不完整或日期格式错误' };
-    }
-    const created = await prisma.interview.create({
-      data: { userId, school, major, city, type, date: parsedDate }
-    });
-    return { ok: true, data: created };
-  }
-
-  if (name === 'analyze_schedule_conflicts') {
-    const interviews = await prisma.interview.findMany({
-      where: { userId },
-      orderBy: { date: 'asc' }
-    });
-    const grouped = interviews.reduce((acc, item) => {
-      const key = toDayKey(item.date);
-      if (!key) return acc;
-      if (!acc[key]) acc[key] = [];
-      acc[key].push(item);
-      return acc;
-    }, {});
-    const conflicts = Object.entries(grouped)
-      .filter(([, items]) => items.length > 1)
-      .map(([day, items]) => ({
-        day,
-        items: items.map((it) => ({
-          id: it.id,
-          school: it.school,
-          major: it.major,
-          city: it.city,
-          type: it.type,
-          date: it.date
-        }))
-      }));
-    return { ok: true, data: { totalInterviews: interviews.length, conflicts } };
-  }
-
-  if (name === 'get_weather') {
-    const { city, mode } = args || {};
-    if (!city || typeof city !== 'string') {
-      return { ok: false, error: 'city 参数缺失或格式错误' };
-    }
-    try {
-      const weather = await getAmapWeather({ city, mode });
-      return { ok: true, data: weather };
-    } catch (error) {
-      return { ok: false, error: error.message || '天气查询失败' };
-    }
-  }
-
-  if (name === 'search_hotels') {
-    const { city, keywords } = args || {};
-    if (!city || !keywords) {
-      return { ok: false, error: 'city 或 keywords 参数缺失' };
-    }
-    try {
-      const hotels = await searchAmapPoi({ city, keywords });
-      return { ok: true, data: hotels };
-    } catch (error) {
-      return { ok: false, error: error.message || '酒店查询失败' };
-    }
-  }
-
-  return { ok: false, error: `不支持的工具: ${name}` };
-};
-
-const callAiChat = async (messages, tools) => {
-  if (!AI_BASE_URL || !AI_API_KEY || !AI_MODEL) {
-    throw new Error('AI_BASE_URL / AI_API_KEY / AI_MODEL 未配置');
-  }
-
-  const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${AI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages,
-      tools,
-      tool_choice: 'auto',
-      temperature: 0.4
+  return result.content
+    .map((item) => {
+      if (item?.type === 'text') return item.text || '';
+      if (item?.type === 'image') return `[image:${item.mimeType || 'unknown'}]`;
+      if (item?.type === 'audio') return `[audio:${item.mimeType || 'unknown'}]`;
+      if (item?.type === 'resource') return `[resource:${item.resource?.uri || 'unknown'}]`;
+      return JSON.stringify(item);
     })
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 请求失败: ${response.status} ${text}`);
-  }
-
-  const data = await response.json();
-  const message = data?.choices?.[0]?.message;
-  if (!message) {
-    throw new Error('AI 响应格式异常');
-  }
-  return message;
+    .filter(Boolean)
+    .join('\n');
 };
 
-const callAiChatStream = async (messages, tools) => {
-  if (!AI_BASE_URL || !AI_API_KEY || !AI_MODEL) {
-    throw new Error('AI_BASE_URL / AI_API_KEY / AI_MODEL 未配置');
+const globalMcpConfigs = parseMcpServerConfigs();
+const userMcpRuntimes = new Map();
+const MCP_CLEANUP_INTERVAL = 1000 * 60 * 60; // 1小时清理一次闲置连接
+const MCP_IDLE_TIMEOUT = 1000 * 60 * 30; // 30分钟无活动自动关闭连接
+
+const sanitizeUserMcpConfig = (config) => {
+  if (!config || typeof config !== 'object') return null;
+  const allowedCommands = ['npx', 'node', 'python'];
+  const dangerousArgs = ['rm', 'del', 'format', 'sudo', 'su', 'chmod', 'chown', 'eval', 'exec', 'bash', 'sh', 'powershell'];
+
+  const name = typeof config.name === 'string' && config.name.trim() ? config.name.trim() : null;
+  const command = typeof config.command === 'string' ? config.command.trim() : '';
+  const args = Array.isArray(config.args) ? config.args.map(arg => String(arg).trim()) : [];
+  const env = config.env && typeof config.env === 'object' && !Array.isArray(config.env)
+    ? Object.fromEntries(Object.entries(config.env).map(([key, value]) => [key, String(value)]))
+    : undefined;
+
+  if (!name || !command) return null;
+  if (!allowedCommands.includes(command.toLowerCase())) return null;
+  if (args.some(arg => dangerousArgs.includes(arg.toLowerCase()))) return null;
+  if (name.toLowerCase() === 'filesystem' || name.toLowerCase() === 'everything') return null;
+
+  return { name, command, args, env };
+};
+
+const cleanupIdleMcpRuntimes = () => {
+  const now = Date.now();
+  for (const [userId, runtime] of userMcpRuntimes.entries()) {
+    if (now - runtime.lastActiveAt > MCP_IDLE_TIMEOUT) {
+      runtime.connections.forEach(conn => {
+        try {
+          conn.client.close();
+          conn.transport.close();
+        } catch (e) { /* ignore */ }
+      });
+      userMcpRuntimes.delete(userId);
+    }
+  }
+};
+
+setInterval(cleanupIdleMcpRuntimes, MCP_CLEANUP_INTERVAL);
+
+
+const initializeMcpRuntime = async (userId = null) => {
+  // 无用户ID时返回全局Runtime
+  if (!userId) {
+    const configs = globalMcpConfigs;
+    const usedNames = new Set();
+    const connections = [];
+    const toolMap = new Map();
+    const aiTools = [];
+    const summary = [];
+
+    for (const config of configs) {
+      const transport = new StdioClientTransport({
+        command: config.command,
+        args: config.args,
+        cwd: config.cwd,
+        env: config.env ? { ...process.env, ...config.env } : undefined,
+        stderr: 'pipe'
+      });
+      const client = new Client({
+        name: `manlv-backend-global-${config.name}`,
+        version: '1.0.0'
+      });
+
+      if (transport.stderr) {
+        transport.stderr.on('data', (chunk) => {
+          const text = String(chunk || '').trim();
+          if (text) {
+            console.log(`[MCP:global:${config.name}] ${text}`);
+          }
+        });
+      }
+
+      transport.onerror = (error) => {
+        console.error(`[MCP:global:${config.name}] transport error:`, error);
+      };
+      transport.onclose = () => {
+        console.warn(`[MCP:global:${config.name}] transport closed`);
+      };
+
+      await client.connect(transport);
+      const toolResult = await client.listTools();
+      const tools = Array.isArray(toolResult?.tools) ? toolResult.tools : [];
+
+      const visibleTools = tools.map((tool) => {
+        const alias = buildMcpToolAlias(config.name, tool.name, usedNames);
+        toolMap.set(alias, {
+          alias,
+          originalName: tool.name,
+          serverName: config.name,
+          client
+        });
+
+        aiTools.push({
+          type: 'function',
+          function: {
+            name: alias,
+            description: `[MCP:${config.name}] ${tool.description || tool.name}`,
+            parameters: normalizeToolSchema(tool.inputSchema)
+          }
+        });
+
+        return {
+          alias,
+          originalName: tool.name,
+          description: tool.description || ''
+        };
+      });
+
+      connections.push({
+        name: config.name,
+        client,
+        transport,
+        tools: visibleTools
+      });
+
+      summary.push({
+        name: config.name,
+        tools: visibleTools.map((tool) => `${tool.alias}: ${tool.description || tool.originalName}`)
+      });
+    }
+
+    return {
+      initialized: true,
+      connections,
+      toolMap,
+      aiTools,
+      summary,
+      lastActiveAt: Date.now()
+    };
   }
 
-  const response = await fetch(`${AI_BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${AI_API_KEY}`
-    },
-    body: JSON.stringify({
-      model: AI_MODEL,
-      messages,
-      tools,
-      tool_choice: 'auto',
-      temperature: 0.4,
-      stream: true
-    })
+  // 有用户ID时创建用户专属Runtime
+  if (userMcpRuntimes.has(userId)) {
+    const runtime = userMcpRuntimes.get(userId);
+    runtime.lastActiveAt = Date.now();
+    return runtime;
+  }
+
+  // 加载用户自定义MCP配置
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { mcpServers: true, mcpEnabled: true }
   });
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`AI 请求失败: ${response.status} ${text}`);
+  let userConfigs = [];
+  if (user?.mcpEnabled && Array.isArray(user?.mcpServers)) {
+    userConfigs = user.mcpServers
+      .map(sanitizeUserMcpConfig)
+      .filter(Boolean);
   }
 
-  return response.body;
+  // 合并全局配置和用户配置
+  const allConfigs = [...globalMcpConfigs, ...userConfigs];
+  const usedNames = new Set();
+  const connections = [];
+  const toolMap = new Map();
+  const aiTools = [];
+  const summary = [];
+
+  for (const config of allConfigs) {
+    const transport = new StdioClientTransport({
+      command: config.command,
+      args: config.args,
+      cwd: config.cwd,
+      env: config.env ? { ...process.env, ...config.env } : undefined,
+      stderr: 'pipe'
+    });
+    const client = new Client({
+      name: `manlv-backend-user-${userId}-${config.name}`,
+      version: '1.0.0'
+    });
+
+    if (transport.stderr) {
+      transport.stderr.on('data', (chunk) => {
+        const text = String(chunk || '').trim();
+        if (text) {
+          console.log(`[MCP:user:${userId}:${config.name}] ${text}`);
+        }
+      });
+    }
+
+    transport.onerror = (error) => {
+      console.error(`[MCP:user:${userId}:${config.name}] transport error:`, error);
+    };
+    transport.onclose = () => {
+      console.warn(`[MCP:user:${userId}:${config.name}] transport closed`);
+    };
+
+    try {
+      await client.connect(transport);
+      const toolResult = await client.listTools();
+      const tools = Array.isArray(toolResult?.tools) ? toolResult.tools : [];
+
+      const visibleTools = tools.map((tool) => {
+        const alias = buildMcpToolAlias(config.name, tool.name, usedNames);
+        toolMap.set(alias, {
+          alias,
+          originalName: tool.name,
+          serverName: config.name,
+          client
+        });
+
+        aiTools.push({
+          type: 'function',
+          function: {
+            name: alias,
+            description: `[MCP:${config.name}] ${tool.description || tool.name}`,
+            parameters: normalizeToolSchema(tool.inputSchema)
+          }
+        });
+
+        return {
+          alias,
+          originalName: tool.name,
+          description: tool.description || ''
+        };
+      });
+
+      connections.push({
+        name: config.name,
+        client,
+        transport,
+        tools: visibleTools
+      });
+
+      summary.push({
+        name: config.name,
+        tools: visibleTools.map((tool) => `${tool.alias}: ${tool.description || tool.originalName}`)
+      });
+    } catch (error) {
+      console.error(`[MCP:user:${userId}:${config.name}] 初始化失败:`, error);
+    }
+  }
+
+  const userRuntime = {
+    initialized: true,
+    connections,
+    toolMap,
+    aiTools,
+    summary,
+    lastActiveAt: Date.now()
+  };
+
+  userMcpRuntimes.set(userId, userRuntime);
+  return userRuntime;
 };
+
+const ensureMcpRuntime = async (userId = null) => {
+  // 无用户ID时使用全局Runtime
+  if (!userId) {
+    if (!globalMcpRuntime) {
+      globalMcpRuntime = await initializeMcpRuntime();
+    }
+    globalMcpRuntime.lastActiveAt = Date.now();
+    return globalMcpRuntime;
+  }
+
+  // 有用户ID时使用用户专属Runtime
+  if (userMcpRuntimes.has(userId)) {
+    const runtime = userMcpRuntimes.get(userId);
+    runtime.lastActiveAt = Date.now();
+    return runtime;
+  }
+
+  const runtime = await initializeMcpRuntime(userId);
+  userMcpRuntimes.set(userId, runtime);
+  return runtime;
+};
+
+// 全局Runtime实例
+let globalMcpRuntime = null;
+
+const getDynamicAiTools = async (userId = null) => {
+  try {
+    const runtime = await ensureMcpRuntime(userId);
+    return runtime.aiTools;
+  } catch (error) {
+    console.error('初始化 MCP 工具失败:', error);
+    return [];
+  }
+};
+
+const getMcpToolSummaryText = async (userId = null) => {
+  const runtime = await ensureMcpRuntime(userId);
+  if (!Array.isArray(runtime.summary) || runtime.summary.length === 0) {
+    return '';
+  }
+
+  return runtime.summary
+    .map((server) => [
+      `- MCP Server: ${server.name}`,
+      ...server.tools.map((toolLine) => `  - ${toolLine}`)
+    ].join('\n'))
+    .join('\n');
+};
+
+const runMcpTool = async (name, args, userId = null) => {
+  const runtime = await ensureMcpRuntime(userId);
+  const tool = runtime.toolMap.get(name);
+  if (!tool) {
+    return null;
+  }
+
+  try {
+    const result = await tool.client.callTool({
+      name: tool.originalName,
+      arguments: args && typeof args === 'object' ? args : {}
+    });
+
+    return {
+      ok: !result?.isError,
+      data: {
+        server: tool.serverName,
+        tool: tool.originalName,
+        content: result?.content || [],
+        text: formatMcpToolContent(result),
+        structuredContent: result?.structuredContent || null
+      }
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error.message || `MCP 工具调用失败: ${name}`
+    };
+  }
+};
+
+const {
+  normalizeAiMode,
+  normalizeMemoryFacts,
+  deriveMemoryPatch,
+  upsertUserMemory,
+  buildPromptContext,
+  extractInterviewStructuredReport
+} = createPromptRuntime({
+  prisma,
+  getMcpToolSummaryText,
+  prompts: {
+    advisor: AI_SYSTEM_PROMPT_ADVISOR,
+    interviewer: AI_SYSTEM_PROMPT_INTERVIEWER
+  }
+});
+
+const larkCliRuntime = createLarkCliRuntime({
+  cwd: process.cwd()
+});
+
+const { getAiTools, runAiTool } = createToolRuntime({
+  prisma,
+  amapApiKey: AMAP_API_KEY,
+  tavilyApiKey: TAVILY_API_KEY,
+  getDynamicAiTools,
+  runMcpTool,
+  larkCliRuntime
+});
+
+const { callAiChat, callAiChatStream } = createModelClient({
+  aiBaseUrl: AI_BASE_URL,
+  aiApiKey: AI_API_KEY,
+  aiModel: AI_MODEL
+});
+
+const aiAgentGraph = createAiAgentGraph({
+  maxSteps: AI_MAX_STEPS,
+  callAiChat,
+  callAiChatStream,
+  runAiTool,
+  extractInterviewStructuredReport
+});
+
+const aiChatHandler = createAiChatHandler({
+  buildPromptContext,
+  normalizeAiMode,
+  getAiTools,
+  aiAgentGraph,
+  deriveMemoryPatch,
+  upsertUserMemory
+});
 
 // Auth middleware
 const authenticateToken = (req, res, next) => {
@@ -898,12 +919,13 @@ app.post('/api/auth/reset-password', async (req, res) => {
 app.get('/api/user', authenticateToken, async (req, res) => {
   try {
     const user = await prisma.user.findUnique({ where: { id: req.user.id } });
-    // 之前漏掉了 major
     res.json({ 
       id: user.id, 
       email: user.email, 
       name: user.name, 
-      major: user.major // <-- 加上这一行
+      major: user.major,
+      memorySummary: user.memorySummary || '',
+      memoryFacts: normalizeMemoryFacts(user.memoryFacts)
     });
   } catch (error) {
     res.status(500).json({ error: 'Server error' });
@@ -913,12 +935,12 @@ app.get('/api/user', authenticateToken, async (req, res) => {
 // Update user profile
 app.put('/api/user', authenticateToken, async (req, res) => {
   try {
-    const { name, email, password, major } = req.body; // <-- 增加 major
+    const { name, email, password, major } = req.body;
     const updateData = {};
     
     if (name) updateData.name = name;
     if (email) updateData.email = email;
-    if (major) updateData.major = major; // <-- 增加这一行
+    if (major) updateData.major = major;
     if (password) {
       updateData.password = await bcrypt.hash(password, 10);
     }
@@ -934,12 +956,52 @@ app.put('/api/user', authenticateToken, async (req, res) => {
         id: updatedUser.id, 
         email: updatedUser.email, 
         name: updatedUser.name,
-        major: updatedUser.major // <-- 返回新字段
+        major: updatedUser.major,
+        memorySummary: updatedUser.memorySummary || '',
+        memoryFacts: normalizeMemoryFacts(updatedUser.memoryFacts)
       } 
     });
   } catch (error) {
     console.error('Update profile error:', error);
     res.status(500).json({ error: '服务器内部错误' });
+  }
+});
+
+app.get('/api/user/memory', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: { memorySummary: true, memoryFacts: true, updatedAt: true }
+    });
+    res.json({
+      memorySummary: (user?.memorySummary || '').trim(),
+      memoryFacts: normalizeMemoryFacts(user?.memoryFacts),
+      updatedAt: user?.updatedAt || null
+    });
+  } catch (error) {
+    console.error('Get memory error:', error);
+    res.status(500).json({ error: '读取长期记忆失败' });
+  }
+});
+
+app.put('/api/user/memory', authenticateToken, async (req, res) => {
+  try {
+    const summary = typeof req.body?.memorySummary === 'string' ? req.body.memorySummary : '';
+    const facts = normalizeMemoryFacts(req.body?.memoryFacts);
+    const updated = await upsertUserMemory(req.user.id, {
+      summary,
+      patchFacts: facts
+    });
+
+    res.json({
+      message: '长期记忆更新成功',
+      memorySummary: updated.memorySummary || '',
+      memoryFacts: normalizeMemoryFacts(updated.memoryFacts),
+      updatedAt: updated.updatedAt
+    });
+  } catch (error) {
+    console.error('Update memory error:', error);
+    res.status(500).json({ error: '更新长期记忆失败' });
   }
 });
 
@@ -1134,128 +1196,7 @@ app.post('/api/parse-resume', authenticateToken, upload.single('file'), async (r
   }
 });
 
-app.post('/api/ai/chat', authenticateToken, async (req, res) => {
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-  res.flushHeaders();
-
-  const send = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-  try {
-    const mode = normalizeAiMode(req.body?.mode);
-    const promptContext = typeof req.body?.context === 'object' && req.body?.context !== null
-      ? req.body.context
-      : {};
-    const inputMessages = Array.isArray(req.body?.messages) ? req.body.messages : null;
-    const singleMessage = typeof req.body?.message === 'string' ? req.body.message : '';
-    const userMessages = inputMessages && inputMessages.length > 0
-      ? inputMessages
-      : (singleMessage ? [{ role: 'user', content: singleMessage }] : []);
-
-    if (userMessages.length === 0) {
-      send({ type: 'error', message: '缺少 messages 或 message' });
-      res.end();
-      return;
-    }
-
-    const systemPrompt = await buildPromptContext(mode, req.user.id, promptContext);
-    const conversation = [
-      { role: 'system', content: systemPrompt },
-      ...userMessages
-    ];
-    const allUsedTools = [];
-
-    // 工具调用循环（非流式，最后一步才流式）
-    for (let i = 0; i < AI_MAX_STEPS; i += 1) {
-      const assistantMessage = await callAiChat(conversation, aiTools);
-      conversation.push({
-        role: 'assistant',
-        content: assistantMessage.content || '',
-        tool_calls: assistantMessage.tool_calls || undefined
-      });
-
-      const toolCalls = Array.isArray(assistantMessage.tool_calls) ? assistantMessage.tool_calls : [];
-
-      // 没有工具调用，说明是最终回复，改用流式输出
-      if (toolCalls.length === 0) {
-        // 重新发起流式请求
-        conversation.pop(); // 移除刚才添加的 assistant 消息，重新流式获取
-        const stream = await callAiChatStream(conversation, aiTools);
-        const reader = stream.getReader();
-        const decoder = new TextDecoder();
-
-        let fullText = '';
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value, { stream: true });
-          const lines = chunk.split('\n');
-          for (const line of lines) {
-            if (!line.startsWith('data:')) continue;
-            const raw = line.replace('data:', '').trim();
-            if (raw === '[DONE]') continue;
-            try {
-              const parsed = JSON.parse(raw);
-              const text = parsed.choices?.[0]?.delta?.content || '';
-              if (!text) continue;
-              if (mode === 'interviewer') {
-                fullText += text;
-              } else {
-                send({ type: 'text', content: text });
-              }
-            } catch (e) {
-              // 忽略解析失败的行
-            }
-          }
-        }
-
-        if (mode === 'interviewer') {
-          const { displayText, report } = extractInterviewStructuredReport(fullText);
-          if (displayText) {
-            send({ type: 'text', content: displayText });
-          }
-          send({ type: 'done', usedTools: allUsedTools, structuredReport: report });
-        } else {
-          send({ type: 'done', usedTools: allUsedTools });
-        }
-        res.end();
-        return;
-      }
-
-      // 有工具调用，执行工具并通知前端
-      for (const toolCall of toolCalls) {
-        const name = toolCall?.function?.name;
-        const rawArgs = toolCall?.function?.arguments || '{}';
-        let parsedArgs = {};
-        try { parsedArgs = JSON.parse(rawArgs); } catch (e) { parsedArgs = {}; }
-
-        // 通知前端正在调用工具
-        send({ type: 'thinking', tool: name });
-
-        const result = await runAiTool(name, parsedArgs, req.user.id);
-        allUsedTools.push({ name, ok: result.ok });
-        conversation.push({
-          role: 'tool',
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(result, null, 2)
-        });
-      }
-
-      if (i === AI_MAX_STEPS - 1) {
-        send({ type: 'text', content: '已达到工具调用上限，请缩小问题范围后重试。' });
-        send({ type: 'done', usedTools: allUsedTools });
-        res.end();
-        return;
-      }
-    }
-  } catch (error) {
-    console.error('AI chat error:', error);
-    send({ type: 'error', message: error.message || 'AI 服务不可用' });
-    res.end();
-  }
-});
+app.post('/api/ai/chat', authenticateToken, aiChatHandler);
 
 // ==================== 简历解析 API ====================
 
