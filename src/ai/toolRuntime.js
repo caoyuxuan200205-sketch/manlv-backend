@@ -112,6 +112,30 @@ const createToolRuntime = ({
     {
       type: 'function',
       function: {
+        name: 'bazi_reading',
+        description: '传统文化陪伴型八字信息整理工具。仅当用户明确提出“算八字”“看八字”“四柱”“命盘”“传统命理陪伴”等请求时调用。支持部分参数缺失，工具会返回缺失项、后续提问建议与陪伴式解读边界。结果仅供传统文化学习与娱乐参考，不构成现实决策建议。',
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: '用户称呼，可选' },
+            calendarType: {
+              type: 'string',
+              enum: ['solar', 'lunar', 'unknown'],
+              description: '出生日期是公历还是农历；未知时传 unknown'
+            },
+            birthDate: { type: 'string', description: '出生日期，建议 YYYY-MM-DD，也可传中文日期文本' },
+            birthTime: { type: 'string', description: '出生时间，例如 09:30、上午9点、子时' },
+            gender: { type: 'string', description: '性别，用于传统命理语境，可留空' },
+            birthPlace: { type: 'string', description: '出生地，例如 江苏南京、湖北武汉' },
+            questionFocus: { type: 'string', description: '最想聚焦的方向，例如 情绪、关系、学业、事业' }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
         name: 'lark_auth_status',
         description: '检查飞书官方 lark-cli 当前登录状态、token 状态和已授权 scope',
         parameters: {
@@ -455,6 +479,219 @@ const createToolRuntime = ({
     };
   };
 
+  const BAZI_DISCLAIMER =
+    '仅供传统文化学习与娱乐参考，不构成医疗、法律、财务、升学或人生决策建议。';
+
+  const normalizeCalendarType = (value) => {
+    const text = String(value || '').trim().toLowerCase();
+    if (!text) return 'unknown';
+    if (['solar', 'gregorian', '公历', '阳历'].includes(text)) return 'solar';
+    if (['lunar', '农历', '阴历'].includes(text)) return 'lunar';
+    return 'unknown';
+  };
+
+  const pad2 = (value) => String(value).padStart(2, '0');
+
+  const normalizeBirthDate = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return '';
+
+    const slashMatch = text.match(/^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?$/);
+    if (slashMatch) {
+      const [, year, month, day] = slashMatch;
+      return `${year}-${pad2(month)}-${pad2(day)}`;
+    }
+
+    return text.replace(/\s+/g, '');
+  };
+
+  const extractHour = (value) => {
+    const text = String(value || '').trim();
+    if (!text) return null;
+
+    const hhmmMatch = text.match(/(\d{1,2})(?::|点|时)(\d{1,2})?/);
+    if (hhmmMatch) {
+      let hour = Number(hhmmMatch[1]);
+      if (Number.isNaN(hour) || hour < 0 || hour > 23) return null;
+      if (/下午|晚上|傍晚/.test(text) && hour < 12) hour += 12;
+      if (/中午/.test(text) && hour < 11) hour += 12;
+      if (/凌晨/.test(text) && hour === 12) hour = 0;
+      return hour;
+    }
+
+    const hourOnlyMatch = text.match(/(\d{1,2})/);
+    if (hourOnlyMatch) {
+      let hour = Number(hourOnlyMatch[1]);
+      if (Number.isNaN(hour) || hour < 0 || hour > 23) return null;
+      if (/下午|晚上|傍晚/.test(text) && hour < 12) hour += 12;
+      if (/中午/.test(text) && hour < 11) hour += 12;
+      if (/凌晨/.test(text) && hour === 12) hour = 0;
+      return hour;
+    }
+
+    const shichenMap = [
+      ['子', 23],
+      ['丑', 1],
+      ['寅', 3],
+      ['卯', 5],
+      ['辰', 7],
+      ['巳', 9],
+      ['午', 11],
+      ['未', 13],
+      ['申', 15],
+      ['酉', 17],
+      ['戌', 19],
+      ['亥', 21]
+    ];
+
+    for (const [label, hour] of shichenMap) {
+      if (text.includes(`${label}时`)) {
+        return hour;
+      }
+    }
+
+    return null;
+  };
+
+  const getShichenLabel = (hour) => {
+    if (hour === null || hour === undefined) return '';
+    if (hour >= 23 || hour < 1) return '子时';
+    if (hour < 3) return '丑时';
+    if (hour < 5) return '寅时';
+    if (hour < 7) return '卯时';
+    if (hour < 9) return '辰时';
+    if (hour < 11) return '巳时';
+    if (hour < 13) return '午时';
+    if (hour < 15) return '未时';
+    if (hour < 17) return '申时';
+    if (hour < 19) return '酉时';
+    if (hour < 21) return '戌时';
+    return '亥时';
+  };
+
+  const getChineseZodiac = (year) => {
+    if (!Number.isInteger(year)) return '';
+    const animals = ['鼠', '牛', '虎', '兔', '龙', '蛇', '马', '羊', '猴', '鸡', '狗', '猪'];
+    return animals[((year - 4) % 12 + 12) % 12];
+  };
+
+  const getSeasonLabel = (month) => {
+    if (!Number.isInteger(month)) return '';
+    if (month >= 3 && month <= 5) return '春';
+    if (month >= 6 && month <= 8) return '夏';
+    if (month >= 9 && month <= 11) return '秋';
+    return '冬';
+  };
+
+  const buildFocusAdvice = (focus) => {
+    const text = String(focus || '').trim();
+    if (!text) {
+      return [
+        '优先把解读落到近期状态观察，而不是做命运定论。',
+        '建议输出可执行的小行动，例如作息、复盘、沟通与节奏调整。'
+      ];
+    }
+
+    if (/情绪|焦虑|压力|疲惫|状态/.test(text)) {
+      return [
+        '先做情绪安顿和节律梳理，再谈传统文化视角下的提醒。',
+        '避免宿命化表述，重点落在本周可执行的恢复动作。'
+      ];
+    }
+
+    if (/学业|保研|面试|升学|事业|工作/.test(text)) {
+      return [
+        '把解读落在阶段节奏、精力分配和准备顺序上。',
+        '遇到重大选择时，明确提醒用户仍要以现实信息和机会成本为准。'
+      ];
+    }
+
+    if (/感情|关系|相处/.test(text)) {
+      return [
+        '重点观察沟通节奏与边界感，不做结果预言。',
+        '建议给出更稳妥的表达和自我照顾方式。'
+      ];
+    }
+
+    return [
+      '保持陪伴式、非决定式表达。',
+      '先讲观察角度，再给轻量建议。'
+    ];
+  };
+
+  const buildFollowupQuestions = (missingFields) => {
+    const mapping = {
+      calendarType: '你的生日是公历还是农历？如果不确定，也可以直接说“我不确定”。',
+      birthDate: '你的出生日期是几几年几月几日？',
+      birthTime: '你的出生时间或时辰是什么？如果只记得大概上午/下午，也可以先告诉我。',
+      gender: '你的性别是？这只用于传统命理语境下的表述。',
+      birthPlace: '你的出生地是哪里？城市级别即可。'
+    };
+
+    return missingFields
+      .map((field) => mapping[field])
+      .filter(Boolean)
+      .slice(0, 5);
+  };
+
+  const buildBaziReading = (args = {}) => {
+    const normalizedInput = {
+      name: String(args.name || '').trim(),
+      calendarType: normalizeCalendarType(args.calendarType),
+      birthDate: normalizeBirthDate(args.birthDate),
+      birthTime: String(args.birthTime || '').trim(),
+      gender: String(args.gender || '').trim(),
+      birthPlace: String(args.birthPlace || '').trim(),
+      questionFocus: String(args.questionFocus || '').trim()
+    };
+
+    const missingFields = [];
+    if (normalizedInput.calendarType === 'unknown') missingFields.push('calendarType');
+    if (!normalizedInput.birthDate) missingFields.push('birthDate');
+    if (!normalizedInput.birthTime) missingFields.push('birthTime');
+    if (!normalizedInput.gender) missingFields.push('gender');
+    if (!normalizedInput.birthPlace) missingFields.push('birthPlace');
+
+    const birthDateMatch = normalizedInput.birthDate.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    const birthYear = birthDateMatch ? Number(birthDateMatch[1]) : null;
+    const birthMonth = birthDateMatch ? Number(birthDateMatch[2]) : null;
+    const birthHour = extractHour(normalizedInput.birthTime);
+
+    const status = missingFields.length > 0 ? 'needs_more_info' : 'ready';
+
+    return {
+      ok: true,
+      data: {
+        status,
+        mode: 'traditional_culture_companion',
+        disclaimer: BAZI_DISCLAIMER,
+        normalizedInput,
+        missingFields,
+        followupQuestions: buildFollowupQuestions(missingFields),
+        supportingSignals: {
+          zodiac: birthYear ? getChineseZodiac(birthYear) : '',
+          season: birthMonth ? getSeasonLabel(birthMonth) : '',
+          shichen: birthHour === null ? '' : getShichenLabel(birthHour)
+        },
+        responseRules: [
+          '仅在用户明确要求时继续本话题，不主动扩展到普通情绪支持场景。',
+          '若信息未补全，优先向用户补齐资料，不提前下判断。',
+          '即使信息齐全，也使用陪伴式、非决定式表达，避免“注定”“必然”等措辞。',
+          '涉及升学、感情、健康、财务等现实选择时，必须提醒用户回到现实信息与专业建议。'
+        ],
+        focusAdvice: buildFocusAdvice(normalizedInput.questionFocus),
+        summaryHints: status === 'ready'
+          ? [
+              '可结合出生季节、生肖意象、时辰节律和用户关注方向做轻量陪伴式解读。',
+              '优先输出状态观察、风险提醒和可执行建议，不给绝对结论。'
+            ]
+          : [
+              '当前信息不足，先补全资料后再进入传统文化陪伴式解读。'
+            ]
+      }
+    };
+  };
+
   const getAiTools = async (userId = null) => {
     const mcpTools = await getDynamicAiTools(userId);
     return [...baseAiTools, ...mcpTools];
@@ -554,6 +791,10 @@ const createToolRuntime = ({
       } catch (error) {
         return { ok: false, error: error.message || '联网搜索失败' };
       }
+    }
+
+    if (name === 'bazi_reading') {
+      return buildBaziReading(args);
     }
 
     if (name === 'lark_auth_status') {
