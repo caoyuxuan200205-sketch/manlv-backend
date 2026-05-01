@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -840,12 +840,17 @@ const authenticateToken = (req, res, next) => {
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { email, password, name } = req.body;
+    const { email, password, name, major } = req.body;
+
+    if (!email || !password || !name || !major) {
+      return res.status(400).json({ error: '请填写完整的注册信息' });
+    }
+
     const hashedPassword = await bcrypt.hash(password, 10);
     const user = await prisma.user.create({
-      data: { email, password: hashedPassword, name }
+      data: { email, password: hashedPassword, name, major }
     });
-    res.status(201).json({ id: user.id, email: user.email, name: user.name });
+    res.status(201).json({ id: user.id, email: user.email, name: user.name, major: user.major });
   } catch (error) {
     res.status(400).json({ error: 'User already exists' });
   }
