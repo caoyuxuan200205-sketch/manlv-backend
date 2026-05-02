@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -14,7 +14,7 @@ const { createAiAgentGraph } = require('./ai/graph');
 const { createToolRuntime } = require('./ai/toolRuntime');
 const { createPromptRuntime } = require('./ai/promptRuntime');
 const { createAiChatHandler } = require('./ai/chatHandler');
-const { createLarkCliRuntime } = require('./ai/larkCliRuntime');
+const { createLarkApiRuntime } = require('./ai/larkApiRuntime');
 require('dotenv').config();
 
 const app = express();
@@ -803,9 +803,7 @@ const {
   }
 });
 
-const larkCliRuntime = createLarkCliRuntime({
-  cwd: process.cwd()
-});
+const larkApiRuntime = createLarkApiRuntime();
 
 const { getAiTools, runAiTool } = createToolRuntime({
   prisma,
@@ -813,7 +811,8 @@ const { getAiTools, runAiTool } = createToolRuntime({
   tavilyApiKey: TAVILY_API_KEY,
   getDynamicAiTools,
   runMcpTool,
-  larkCliRuntime
+  larkApiRuntime,
+  refreshFeishuAccessTokenForUser: (user) => refreshFeishuAccessTokenForUser(user)
 });
 
 const { callAiChat, callAiChatStream } = createModelClient({

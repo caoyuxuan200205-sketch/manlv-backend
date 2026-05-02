@@ -122,7 +122,8 @@ const createToolRuntime = ({
   tavilyApiKey,
   getDynamicAiTools,
   runMcpTool,
-  larkCliRuntime
+  larkApiRuntime,
+  refreshFeishuAccessTokenForUser
 }) => {
   const baseAiTools = [
     {
@@ -815,6 +816,26 @@ const createToolRuntime = ({
     select: FEISHU_BINDING_SELECT
   });
 
+  const ensureFeishuToken = async (userId) => {
+    if (!userId) throw new Error('缺少用户身份');
+    let user = await getFeishuUserBinding(userId);
+    if (!user || !user.feishuOpenId) {
+      throw new Error('当前账号未绑定飞书，请先完成授权');
+    }
+    
+    if (isDateExpired(user.feishuAccessTokenExpiresAt, FEISHU_TOKEN_REFRESH_SKEW_MS)) {
+      if (!user.feishuRefreshToken || isDateExpired(user.feishuRefreshTokenExpiresAt)) {
+         throw new Error('飞书授权已过期，请重新发起授权绑定');
+      }
+      try {
+         user = await refreshFeishuAccessTokenForUser(user);
+      } catch (err) {
+         throw new Error('飞书授权刷新失败，请重新发起授权绑定');
+      }
+    }
+    return user.feishuAccessToken;
+  };
+
   const runAiTool = async (name, args, userId) => {
     if (name === 'get_user_profile') {
       const user = await prisma.user.findUnique({
@@ -976,12 +997,22 @@ const createToolRuntime = ({
 
     if (name === 'lark_docs_search') {
       const { query = '', pageSize = 10 } = args || {};
-      return larkCliRuntime.searchDocs({ query, pageSize });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.searchDocs(token, { query, pageSize });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_docs_fetch') {
       const { doc, apiVersion = 'v2', limit, offset } = args || {};
-      return larkCliRuntime.fetchDoc({ doc, apiVersion, limit, offset });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.fetchDoc(token, { doc, apiVersion, limit, offset });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_docs_create') {
@@ -992,13 +1023,18 @@ const createToolRuntime = ({
         parentToken,
         parentPosition
       } = args || {};
-      return larkCliRuntime.createDoc({
-        content,
-        docFormat,
-        apiVersion,
-        parentToken,
-        parentPosition
-      });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.createDoc(token, {
+          content,
+          docFormat,
+          apiVersion,
+          parentToken,
+          parentPosition
+        });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_docs_update') {
@@ -1013,17 +1049,22 @@ const createToolRuntime = ({
         srcBlockIds,
         revisionId
       } = args || {};
-      return larkCliRuntime.updateDoc({
-        doc,
-        command,
-        content,
-        docFormat,
-        apiVersion,
-        pattern,
-        blockId,
-        srcBlockIds,
-        revisionId
-      });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.updateDoc(token, {
+          doc,
+          command,
+          content,
+          docFormat,
+          apiVersion,
+          pattern,
+          blockId,
+          srcBlockIds,
+          revisionId
+        });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_calendar_agenda') {
@@ -1033,12 +1074,17 @@ const createToolRuntime = ({
         calendarId = 'primary',
         format = 'json'
       } = args || {};
-      return larkCliRuntime.getCalendarAgenda({
-        start,
-        end,
-        calendarId,
-        format
-      });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.getCalendarAgenda(token, {
+          start,
+          end,
+          calendarId,
+          format
+        });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_calendar_create') {
@@ -1052,16 +1098,21 @@ const createToolRuntime = ({
         rrule,
         dryRun = false
       } = args || {};
-      return larkCliRuntime.createCalendarEvent({
-        summary,
-        start,
-        end,
-        description,
-        attendeeIds,
-        calendarId,
-        rrule,
-        dryRun
-      });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.createCalendarEvent(token, {
+          summary,
+          start,
+          end,
+          description,
+          attendeeIds,
+          calendarId,
+          rrule,
+          dryRun
+        });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     if (name === 'lark_drive_list_files') {
@@ -1073,14 +1124,19 @@ const createToolRuntime = ({
         pageAll = false,
         pageLimit = 3
       } = args || {};
-      return larkCliRuntime.listDriveFiles({
-        folderToken,
-        orderBy,
-        direction,
-        pageSize,
-        pageAll,
-        pageLimit
-      });
+      try {
+        const token = await ensureFeishuToken(userId);
+        return larkApiRuntime.listDriveFiles(token, {
+          folderToken,
+          orderBy,
+          direction,
+          pageSize,
+          pageAll,
+          pageLimit
+        });
+      } catch (error) {
+        return { ok: false, error: error.message };
+      }
     }
 
     const mcpResult = await runMcpTool(name, args, userId);
