@@ -1,3 +1,121 @@
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+
+const FEISHU_CLIENT_ID = (process.env.FEISHU_CLIENT_ID || '').trim();
+const FEISHU_CLIENT_SECRET = (process.env.FEISHU_CLIENT_SECRET || '').trim();
+const FEISHU_REDIRECT_URI = (process.env.FEISHU_REDIRECT_URI || '').trim();
+const FEISHU_OAUTH_SCOPES = (process.env.FEISHU_OAUTH_SCOPES || 'auth:user.id:read user_profile offline_access').trim();
+const FEISHU_OAUTH_PROMPT = (process.env.FEISHU_OAUTH_PROMPT || 'consent').trim();
+const FEISHU_OAUTH_SUCCESS_REDIRECT = (process.env.FEISHU_OAUTH_SUCCESS_REDIRECT || '').trim();
+const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+const FEISHU_STATE_TTL_SECONDS = 10 * 60;
+const FEISHU_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
+
+const FEISHU_BINDING_SELECT = {
+  id: true,
+  feishuOpenId: true,
+  feishuUnionId: true,
+  feishuUserId: true,
+  feishuTenantKey: true,
+  feishuName: true,
+  feishuEmail: true,
+  feishuAvatarUrl: true,
+  feishuScope: true,
+  feishuAccessToken: true,
+  feishuRefreshToken: true,
+  feishuAccessTokenExpiresAt: true,
+  feishuRefreshTokenExpiresAt: true,
+  feishuConnectedAt: true
+};
+
+const parseFeishuScopeList = (scopeValue) => String(scopeValue || '')
+  .split(/\s+/)
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+const normalizeOptionalUrl = (value) => {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    return new URL(value.trim()).toString();
+  } catch (error) {
+    return '';
+  }
+};
+
+const toIsoStringOrNull = (value) => {
+  if (!value) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+};
+
+const isDateExpired = (value, skewMs = 0) => {
+  if (!value) return true;
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return true;
+  return parsed.getTime() <= Date.now() + skewMs;
+};
+
+const isFeishuOAuthConfigured = () => Boolean(
+  FEISHU_CLIENT_ID && FEISHU_CLIENT_SECRET && FEISHU_REDIRECT_URI && process.env.JWT_SECRET
+);
+
+const buildFeishuBindingStatus = (user, extras = {}) => {
+  const accessTokenExpiresAt = user?.feishuAccessTokenExpiresAt || null;
+  const refreshTokenExpiresAt = user?.feishuRefreshTokenExpiresAt || null;
+  const tokenValid = Boolean(user?.feishuAccessToken) && !isDateExpired(accessTokenExpiresAt, FEISHU_TOKEN_REFRESH_SKEW_MS);
+  const refreshTokenValid = Boolean(user?.feishuRefreshToken) && !isDateExpired(refreshTokenExpiresAt);
+
+  return {
+    provider: 'feishu_oauth',
+    configured: isFeishuOAuthConfigured(),
+    connected: Boolean(user?.feishuOpenId),
+    tokenValid,
+    refreshTokenValid,
+    needsAuthorization: !user?.feishuOpenId,
+    needsReauth: Boolean(user?.feishuOpenId) && !tokenValid && !refreshTokenValid,
+    accessTokenExpiresAt: toIsoStringOrNull(accessTokenExpiresAt),
+    refreshTokenExpiresAt: toIsoStringOrNull(refreshTokenExpiresAt),
+    connectedAt: toIsoStringOrNull(user?.feishuConnectedAt),
+    scope: parseFeishuScopeList(user?.feishuScope),
+    profile: user?.feishuOpenId ? {
+      openId: user.feishuOpenId,
+      unionId: user.feishuUnionId || null,
+      userId: user.feishuUserId || null,
+      tenantKey: user.feishuTenantKey || null,
+      name: user.feishuName || null,
+      email: user.feishuEmail || null,
+      avatarUrl: user.feishuAvatarUrl || null
+    } : null,
+    ...extras
+  };
+};
+
+const buildFeishuStateToken = ({ userId, clientRedirectUri }) => jwt.sign(
+  {
+    type: 'feishu_oauth_state',
+    userId,
+    clientRedirectUri: clientRedirectUri || '',
+    nonce: crypto.randomBytes(16).toString('hex')
+  },
+  process.env.JWT_SECRET,
+  { expiresIn: FEISHU_STATE_TTL_SECONDS }
+);
+
+const buildFeishuAuthorizeUrl = ({ state }) => {
+  const url = new URL(FEISHU_AUTHORIZE_URL);
+  url.searchParams.set('client_id', FEISHU_CLIENT_ID);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', FEISHU_REDIRECT_URI);
+  if (FEISHU_OAUTH_SCOPES) {
+    url.searchParams.set('scope', FEISHU_OAUTH_SCOPES);
+  }
+  if (FEISHU_OAUTH_PROMPT) {
+    url.searchParams.set('prompt', FEISHU_OAUTH_PROMPT);
+  }
+  url.searchParams.set('state', state);
+  return url.toString();
+};
+
 const createToolRuntime = ({
   prisma,
   amapApiKey,
@@ -137,7 +255,7 @@ const createToolRuntime = ({
       type: 'function',
       function: {
         name: 'lark_auth_status',
-        description: '检查飞书官方 lark-cli 当前登录状态、token 状态和已授权 scope',
+        description: '检查当前漫旅用户是否已绑定自己的飞书账号，并返回 OAuth 授权状态、token 状态和已授权 scope。适用于手机端和 H5。',
         parameters: {
           type: 'object',
           properties: {},
@@ -149,16 +267,11 @@ const createToolRuntime = ({
       type: 'function',
       function: {
         name: 'lark_auth_login_start',
-        description: '启动飞书官方 lark-cli 登录流程，返回用户需要打开的授权信息。适用于 token 过期或未登录时。',
+        description: '为当前漫旅用户生成飞书 OAuth 授权链接。用户可在手机浏览器中直接打开完成授权，禁止提示用户运行 lark-cli 或 config init。',
         parameters: {
           type: 'object',
           properties: {
-            recommend: { type: 'boolean', description: '是否使用官方推荐 scopes' },
-            domains: {
-              type: 'array',
-              items: { type: 'string' },
-              description: '需要授权的业务域，例如 docs,drive'
-            }
+            redirectUri: { type: 'string', description: '授权成功后前端希望回跳的地址，可选；适合 H5 页面或 App 深链' }
           },
           additionalProperties: false
         }
@@ -697,6 +810,11 @@ const createToolRuntime = ({
     return [...baseAiTools, ...mcpTools];
   };
 
+  const getFeishuUserBinding = async (userId) => prisma.user.findUnique({
+    where: { id: userId },
+    select: FEISHU_BINDING_SELECT
+  });
+
   const runAiTool = async (name, args, userId) => {
     if (name === 'get_user_profile') {
       const user = await prisma.user.findUnique({
@@ -798,12 +916,62 @@ const createToolRuntime = ({
     }
 
     if (name === 'lark_auth_status') {
-      return larkCliRuntime.getAuthStatus();
+      if (!userId) {
+        return { ok: false, error: '当前缺少用户身份，无法检查飞书绑定状态' };
+      }
+
+      const user = await getFeishuUserBinding(userId);
+      if (!user) {
+        return { ok: false, error: '用户不存在，无法检查飞书绑定状态' };
+      }
+
+      const status = buildFeishuBindingStatus(user, {
+        message: isFeishuOAuthConfigured()
+          ? (user.feishuOpenId
+            ? '当前漫旅账号已绑定飞书账号'
+            : '当前漫旅账号尚未绑定飞书账号')
+          : '服务端尚未完成飞书 OAuth 配置'
+      });
+      return { ok: true, data: status };
     }
 
     if (name === 'lark_auth_login_start') {
-      const { recommend = true, domains = ['docs', 'drive'] } = args || {};
-      return larkCliRuntime.startAuthLogin({ recommend, domains });
+      if (!userId) {
+        return { ok: false, error: '当前缺少用户身份，无法生成飞书授权链接' };
+      }
+      if (!isFeishuOAuthConfigured()) {
+        return {
+          ok: false,
+          error: '当前飞书 OAuth 尚未配置完成，请联系管理员检查服务端环境变量与回调地址配置'
+        };
+      }
+
+      const user = await getFeishuUserBinding(userId);
+      if (!user) {
+        return { ok: false, error: '用户不存在，无法生成飞书授权链接' };
+      }
+
+      const redirectUri = normalizeOptionalUrl(args?.redirectUri) || normalizeOptionalUrl(FEISHU_OAUTH_SUCCESS_REDIRECT);
+      const state = buildFeishuStateToken({
+        userId,
+        clientRedirectUri: redirectUri
+      });
+
+      return {
+        ok: true,
+        data: {
+          provider: 'feishu_oauth',
+          mobileSupported: true,
+          alreadyConnected: Boolean(user.feishuOpenId),
+          authorizeUrl: buildFeishuAuthorizeUrl({ state }),
+          callbackUri: FEISHU_REDIRECT_URI,
+          clientRedirectUri: redirectUri || null,
+          expiresIn: FEISHU_STATE_TTL_SECONDS,
+          scope: parseFeishuScopeList(FEISHU_OAUTH_SCOPES),
+          prompt: FEISHU_OAUTH_PROMPT || null,
+          message: '请直接打开 authorizeUrl 完成飞书授权，完成后返回漫旅即可。'
+        }
+      };
     }
 
     if (name === 'lark_docs_search') {

@@ -1,4 +1,4 @@
-﻿﻿﻿﻿﻿﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -34,6 +34,10 @@ const FEISHU_OAUTH_SCOPES = (process.env.FEISHU_OAUTH_SCOPES || 'auth:user.id:re
 const FEISHU_OAUTH_PROMPT = (process.env.FEISHU_OAUTH_PROMPT || 'consent').trim();
 const FEISHU_OAUTH_SUCCESS_REDIRECT = (process.env.FEISHU_OAUTH_SUCCESS_REDIRECT || '').trim();
 const FEISHU_OAUTH_FAILURE_REDIRECT = (process.env.FEISHU_OAUTH_FAILURE_REDIRECT || '').trim();
+const FEISHU_ALLOWED_REDIRECT_ORIGINS = (process.env.FEISHU_ALLOWED_REDIRECT_ORIGINS || '')
+  .split(',')
+  .map((item) => item.trim())
+  .filter(Boolean);
 const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
 const FEISHU_USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
@@ -77,7 +81,8 @@ const AI_SYSTEM_PROMPT_ADVISOR =
 - 当用户询问具体的院校动态、截止日期、导师近况或需要最新资讯时，优先调用 \`web_search\`。
 - 当用户明确提出“算八字”“看八字”“四柱”“命盘”“传统命理陪伴”等请求时，才允许调用 \`bazi_reading\`；若资料不全，先补齐出生日期、时辰、性别、出生地与公历/农历信息。
 - 使用 \`bazi_reading\` 时，必须明确说明“仅供传统文化学习与娱乐参考，不构成现实决策依据”，并把结论落在情绪安顿、节奏提醒与可执行建议上。
-- 当用户询问飞书/云文档/知识库/云盘文件时，优先调用 \`lark_auth_status\` 检查登录状态；若状态异常，再调用 \`lark_auth_login_start\` 或明确提示用户刷新登录。
+- 当用户询问飞书/云文档/知识库/云盘文件时，优先调用 \`lark_auth_status\` 检查当前漫旅账号是否已绑定飞书；若未绑定或需要重新授权，再调用 \`lark_auth_login_start\` 生成手机端可直接打开的授权链接。
+- 涉及飞书授权时，禁止提示用户运行 \`lark-cli\`、\`config init\`、终端命令或桌面端登录流程；必须优先给出手机端可点击的 OAuth 授权链接和简短操作说明。
 - 在联网搜索后，应整合搜索结果，给出结构化、可操作的建议。
 - **必须在回复中包含来源链接**：使用 Markdown 格式（如 [来源标题](URL)）在相关信息末尾或文末列出参考资料链接，确保用户可以点击跳转到原网页核实。
 - **链接约束**：只有联网搜索结果或工具明确返回 URL 时，才允许输出链接。对于飞书日程、飞书文档等内部对象，若工具返回中没有 URL，禁止自行猜测、拼接或编造链接。
@@ -867,6 +872,43 @@ const normalizeOptionalUrl = (value) => {
   }
 };
 
+const pickUrlOrigin = (value) => {
+  const normalized = normalizeOptionalUrl(value);
+  if (!normalized) return '';
+  try {
+    return new URL(normalized).origin;
+  } catch (error) {
+    return '';
+  }
+};
+
+const getFeishuAllowedRedirectOrigins = () => {
+  const builtInOrigins = [
+    pickUrlOrigin(FEISHU_OAUTH_SUCCESS_REDIRECT),
+    pickUrlOrigin(FEISHU_OAUTH_FAILURE_REDIRECT)
+  ].filter(Boolean);
+
+  return Array.from(new Set([
+    ...builtInOrigins,
+    ...FEISHU_ALLOWED_REDIRECT_ORIGINS
+  ]));
+};
+
+const sanitizeFeishuClientRedirectUri = (value) => {
+  const normalized = normalizeOptionalUrl(value);
+  if (!normalized) return '';
+
+  const allowedOrigins = getFeishuAllowedRedirectOrigins();
+  if (allowedOrigins.length === 0) return '';
+
+  try {
+    const parsed = new URL(normalized);
+    return allowedOrigins.includes(parsed.origin) ? parsed.toString() : '';
+  } catch (error) {
+    return '';
+  }
+};
+
 const parseFeishuScopeList = (scopeValue) => String(scopeValue || '')
   .split(/\s+/)
   .map((item) => item.trim())
@@ -1212,7 +1254,7 @@ app.get('/api/auth/feishu/start', authenticateToken, async (req, res) => {
   }
 
   try {
-    const clientRedirectUri = normalizeOptionalUrl(
+    const clientRedirectUri = sanitizeFeishuClientRedirectUri(
       pickSingleValue(req.query.redirect_uri) ||
       pickSingleValue(req.query.redirect) ||
       ''
@@ -1246,7 +1288,7 @@ app.get('/api/auth/feishu/callback', async (req, res) => {
 
   try {
     statePayload = verifyFeishuStateToken(rawState);
-    const stateRedirectUri = normalizeOptionalUrl(statePayload.clientRedirectUri);
+    const stateRedirectUri = sanitizeFeishuClientRedirectUri(statePayload.clientRedirectUri);
     successRedirectUri = stateRedirectUri
       || normalizeOptionalUrl(FEISHU_OAUTH_SUCCESS_REDIRECT);
     failureRedirectUri = stateRedirectUri
