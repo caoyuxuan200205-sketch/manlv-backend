@@ -21,6 +21,8 @@
 
 漫旅后端基于 **Node.js + Express** 构建，提供用户认证、行程管理、邮件处理等 REST API，并内置 **AI Agent 循环**，通过 DashScope（兼容 OpenAI 格式）驱动 Qwen 大模型，支持工具调用与 SSE 流式输出。
 
+通过深度集成 **飞书开放平台 (Feishu OpenAPI)**、高德地图 API 以及 Tavily 联网搜索，该后端能赋予 AI 助手调度真实世界数据的能力。
+
 ---
 
 ## 🛠️ 技术栈
@@ -33,6 +35,7 @@
 | 数据库 | PostgreSQL |
 | 认证 | JWT · bcryptjs |
 | AI | Qwen-Plus / Qwen-Max（DashScope，兼容 OpenAI 格式）|
+| 第三方集成 | 飞书 OpenAPI · Tavily 联网搜索 · 高德地图 API |
 | 流式输出 | SSE（Server-Sent Events）|
 
 ---
@@ -389,7 +392,14 @@ Authorization: Bearer <token>
 | `list_interviews` | 查询用户面试安排列表 |
 | `create_interview` | 创建新的面试记录 |
 | `analyze_schedule_conflicts` | 分析同日行程冲突 |
+| `get_weather` | 查询指定城市的天气信息 |
+| `search_hotels` | 搜索目的地周边酒店 |
 | `web_search` | 联网搜索最新保研资讯与动态 |
+| `bazi_reading` | 传统文化命理排盘与陪伴 |
+| `lark_auth_*` | 飞书 OAuth 账号绑定与状态检查 |
+| `lark_docs_*` | 通过飞书 OpenAPI 搜索/读取/创建文档 |
+| `lark_calendar_*` | 通过飞书 OpenAPI 查询/创建日程安排 |
+| `lark_drive_*` | 通过飞书 OpenAPI 读取云盘文件 |
 
 ### MCP 扩展工具
 
