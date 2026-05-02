@@ -18,6 +18,20 @@ model User {
   memoryFacts   Json?
   mcpServers    Json?
   mcpEnabled    Boolean     @default(false)
+  feishuOpenId  String?     @unique
+  feishuUnionId String?
+  feishuUserId  String?
+  feishuTenantKey String?
+  feishuName    String?
+  feishuEmail   String?
+  feishuAvatarUrl String?   @db.Text
+  feishuAccessToken String? @db.Text
+  feishuRefreshToken String? @db.Text
+  feishuScope   String?     @db.Text
+  feishuTokenType String?
+  feishuAccessTokenExpiresAt DateTime?
+  feishuRefreshTokenExpiresAt DateTime?
+  feishuConnectedAt DateTime?
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
   emails        Email[]

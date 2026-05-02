@@ -1,4 +1,4 @@
-﻿﻿const express = require('express');
+﻿﻿﻿﻿﻿﻿const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const { Client } = require('@modelcontextprotocol/sdk/client');
 const { StdioClientTransport } = require('@modelcontextprotocol/sdk/client/stdio.js');
 const { createModelClient } = require('./ai/modelClient');
@@ -26,6 +27,18 @@ const AI_MAX_STEPS = Number(process.env.AI_MAX_STEPS || 6);
 const AMAP_API_KEY = process.env.AMAP_API_KEY || '';
 const TAVILY_API_KEY = process.env.TAVILY_API_KEY || '';
 const MCP_SERVERS_JSON = process.env.MCP_SERVERS_JSON || '';
+const FEISHU_CLIENT_ID = (process.env.FEISHU_CLIENT_ID || '').trim();
+const FEISHU_CLIENT_SECRET = (process.env.FEISHU_CLIENT_SECRET || '').trim();
+const FEISHU_REDIRECT_URI = (process.env.FEISHU_REDIRECT_URI || '').trim();
+const FEISHU_OAUTH_SCOPES = (process.env.FEISHU_OAUTH_SCOPES || 'auth:user.id:read user_profile offline_access').trim();
+const FEISHU_OAUTH_PROMPT = (process.env.FEISHU_OAUTH_PROMPT || 'consent').trim();
+const FEISHU_OAUTH_SUCCESS_REDIRECT = (process.env.FEISHU_OAUTH_SUCCESS_REDIRECT || '').trim();
+const FEISHU_OAUTH_FAILURE_REDIRECT = (process.env.FEISHU_OAUTH_FAILURE_REDIRECT || '').trim();
+const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
+const FEISHU_TOKEN_URL = 'https://open.feishu.cn/open-apis/authen/v2/oauth/token';
+const FEISHU_USER_INFO_URL = 'https://open.feishu.cn/open-apis/authen/v1/user_info';
+const FEISHU_STATE_TTL_SECONDS = 10 * 60;
+const FEISHU_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
 const AI_SYSTEM_PROMPT_ADVISOR =
   process.env.AI_SYSTEM_PROMPT_ADVISOR ||
   process.env.AI_SYSTEM_PROMPT ||
@@ -821,6 +834,305 @@ const aiChatHandler = createAiChatHandler({
   upsertUserMemory
 });
 
+const FEISHU_BINDING_SELECT = {
+  id: true,
+  feishuOpenId: true,
+  feishuUnionId: true,
+  feishuUserId: true,
+  feishuTenantKey: true,
+  feishuName: true,
+  feishuEmail: true,
+  feishuAvatarUrl: true,
+  feishuAccessToken: true,
+  feishuRefreshToken: true,
+  feishuScope: true,
+  feishuTokenType: true,
+  feishuAccessTokenExpiresAt: true,
+  feishuRefreshTokenExpiresAt: true,
+  feishuConnectedAt: true
+};
+
+const pickSingleValue = (value) => Array.isArray(value) ? value[0] : value;
+
+const isFeishuOAuthConfigured = () => Boolean(
+  FEISHU_CLIENT_ID && FEISHU_CLIENT_SECRET && FEISHU_REDIRECT_URI
+);
+
+const normalizeOptionalUrl = (value) => {
+  if (typeof value !== 'string' || !value.trim()) return '';
+  try {
+    return new URL(value.trim()).toString();
+  } catch (error) {
+    return '';
+  }
+};
+
+const parseFeishuScopeList = (scopeValue) => String(scopeValue || '')
+  .split(/\s+/)
+  .map((item) => item.trim())
+  .filter(Boolean);
+
+const toIsoStringOrNull = (value) => {
+  if (!value) return null;
+  const parsed = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+};
+
+const buildFeishuExpiryAt = (expiresInSeconds) => {
+  const seconds = Number(expiresInSeconds);
+  if (!Number.isFinite(seconds) || seconds <= 0) return null;
+  return new Date(Date.now() + seconds * 1000);
+};
+
+const isDateExpired = (value, skewMs = 0) => {
+  if (!value) return true;
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return true;
+  return parsed.getTime() <= Date.now() + skewMs;
+};
+
+const appendQueryParamsToUrl = (targetUrl, params) => {
+  const url = new URL(targetUrl);
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value === undefined || value === null || value === '') return;
+    url.searchParams.set(key, String(value));
+  });
+  return url.toString();
+};
+
+const escapeHtml = (value) => String(value || '')
+  .replace(/&/g, '&amp;')
+  .replace(/</g, '&lt;')
+  .replace(/>/g, '&gt;')
+  .replace(/"/g, '&quot;')
+  .replace(/'/g, '&#39;');
+
+const buildFeishuBindingStatus = (user, extras = {}) => {
+  const accessTokenExpiresAt = user?.feishuAccessTokenExpiresAt || null;
+  const refreshTokenExpiresAt = user?.feishuRefreshTokenExpiresAt || null;
+  const tokenValid = Boolean(user?.feishuAccessToken) && !isDateExpired(accessTokenExpiresAt);
+  const refreshTokenValid = Boolean(user?.feishuRefreshToken) && !isDateExpired(refreshTokenExpiresAt);
+
+  return {
+    configured: isFeishuOAuthConfigured(),
+    connected: Boolean(user?.feishuOpenId),
+    tokenValid,
+    refreshTokenValid,
+    needsReauth: Boolean(user?.feishuOpenId) && !tokenValid && !refreshTokenValid,
+    accessTokenExpiresAt: toIsoStringOrNull(accessTokenExpiresAt),
+    refreshTokenExpiresAt: toIsoStringOrNull(refreshTokenExpiresAt),
+    connectedAt: toIsoStringOrNull(user?.feishuConnectedAt),
+    scope: parseFeishuScopeList(user?.feishuScope),
+    profile: user?.feishuOpenId ? {
+      openId: user.feishuOpenId,
+      unionId: user.feishuUnionId || null,
+      userId: user.feishuUserId || null,
+      tenantKey: user.feishuTenantKey || null,
+      name: user.feishuName || null,
+      email: user.feishuEmail || null,
+      avatarUrl: user.feishuAvatarUrl || null
+    } : null,
+    ...extras
+  };
+};
+
+const buildFeishuStateToken = ({ userId, clientRedirectUri }) => jwt.sign(
+  {
+    type: 'feishu_oauth_state',
+    userId,
+    clientRedirectUri: clientRedirectUri || '',
+    nonce: crypto.randomBytes(16).toString('hex')
+  },
+  process.env.JWT_SECRET,
+  { expiresIn: FEISHU_STATE_TTL_SECONDS }
+);
+
+const verifyFeishuStateToken = (stateToken) => {
+  const payload = jwt.verify(stateToken, process.env.JWT_SECRET);
+  if (!payload || payload.type !== 'feishu_oauth_state' || !payload.userId) {
+    throw new Error('飞书授权状态校验失败');
+  }
+  return payload;
+};
+
+const buildFeishuAuthorizeUrl = ({ state }) => {
+  const url = new URL(FEISHU_AUTHORIZE_URL);
+  url.searchParams.set('client_id', FEISHU_CLIENT_ID);
+  url.searchParams.set('response_type', 'code');
+  url.searchParams.set('redirect_uri', FEISHU_REDIRECT_URI);
+  if (FEISHU_OAUTH_SCOPES) {
+    url.searchParams.set('scope', FEISHU_OAUTH_SCOPES);
+  }
+  if (FEISHU_OAUTH_PROMPT) {
+    url.searchParams.set('prompt', FEISHU_OAUTH_PROMPT);
+  }
+  url.searchParams.set('state', state);
+  return url.toString();
+};
+
+const createFeishuApiError = (message, details = {}) => {
+  const error = new Error(message);
+  error.details = details;
+  return error;
+};
+
+const parseJsonSafely = (text) => {
+  try {
+    return JSON.parse(text);
+  } catch (error) {
+    return null;
+  }
+};
+
+const requestFeishuApi = async (url, options = {}, fallbackMessage = '飞书接口请求失败') => {
+  const response = await fetch(url, options);
+  const rawText = await response.text();
+  const payload = parseJsonSafely(rawText);
+
+  if (!response.ok) {
+    throw createFeishuApiError(
+      payload?.error_description || payload?.msg || fallbackMessage,
+      {
+        status: response.status,
+        payload,
+        rawText
+      }
+    );
+  }
+
+  if (payload && typeof payload.code === 'number' && payload.code !== 0) {
+    throw createFeishuApiError(
+      payload.msg || fallbackMessage,
+      {
+        status: response.status,
+        payload,
+        rawText
+      }
+    );
+  }
+
+  if (!payload) {
+    throw createFeishuApiError(fallbackMessage, {
+      status: response.status,
+      rawText
+    });
+  }
+
+  return payload;
+};
+
+const requestFeishuToken = async (tokenRequestBody) => requestFeishuApi(
+  FEISHU_TOKEN_URL,
+  {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify(tokenRequestBody)
+  },
+  '获取飞书访问凭证失败'
+);
+
+const fetchFeishuUserInfo = async (accessToken) => {
+  const payload = await requestFeishuApi(
+    FEISHU_USER_INFO_URL,
+    {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${accessToken}`,
+        'Content-Type': 'application/json; charset=utf-8'
+      }
+    },
+    '获取飞书用户信息失败'
+  );
+  return payload.data || null;
+};
+
+const buildFeishuBindingUpdateData = (tokenPayload, userInfo) => ({
+  feishuOpenId: userInfo?.open_id || null,
+  feishuUnionId: userInfo?.union_id || null,
+  feishuUserId: userInfo?.user_id || null,
+  feishuTenantKey: userInfo?.tenant_key || null,
+  feishuName: userInfo?.name || null,
+  feishuEmail: userInfo?.email || userInfo?.enterprise_email || null,
+  feishuAvatarUrl: userInfo?.avatar_url || userInfo?.avatar_big || userInfo?.avatar_middle || null,
+  feishuAccessToken: tokenPayload?.access_token || null,
+  feishuRefreshToken: tokenPayload?.refresh_token || null,
+  feishuScope: tokenPayload?.scope || null,
+  feishuTokenType: tokenPayload?.token_type || 'Bearer',
+  feishuAccessTokenExpiresAt: buildFeishuExpiryAt(tokenPayload?.expires_in),
+  feishuRefreshTokenExpiresAt: buildFeishuExpiryAt(tokenPayload?.refresh_token_expires_in),
+  feishuConnectedAt: new Date()
+});
+
+const buildFeishuRefreshUpdateData = (existingUser, tokenPayload) => ({
+  feishuAccessToken: tokenPayload?.access_token || existingUser.feishuAccessToken || null,
+  feishuRefreshToken: tokenPayload?.refresh_token || existingUser.feishuRefreshToken || null,
+  feishuScope: tokenPayload?.scope || existingUser.feishuScope || null,
+  feishuTokenType: tokenPayload?.token_type || existingUser.feishuTokenType || 'Bearer',
+  feishuAccessTokenExpiresAt: buildFeishuExpiryAt(tokenPayload?.expires_in),
+  feishuRefreshTokenExpiresAt: tokenPayload?.refresh_token_expires_in
+    ? buildFeishuExpiryAt(tokenPayload.refresh_token_expires_in)
+    : existingUser.feishuRefreshTokenExpiresAt || null
+});
+
+const refreshFeishuAccessTokenForUser = async (user) => {
+  if (!user?.feishuRefreshToken) {
+    throw new Error('当前飞书账号缺少 refresh_token，请重新授权');
+  }
+
+  const tokenPayload = await requestFeishuToken({
+    grant_type: 'refresh_token',
+    client_id: FEISHU_CLIENT_ID,
+    client_secret: FEISHU_CLIENT_SECRET,
+    refresh_token: user.feishuRefreshToken
+  });
+
+  return prisma.user.update({
+    where: { id: user.id },
+    data: buildFeishuRefreshUpdateData(user, tokenPayload),
+    select: FEISHU_BINDING_SELECT
+  });
+};
+
+const sendFeishuOAuthResult = (res, { ok, message, redirectUri, extraQuery = {}, statusCode }) => {
+  if (redirectUri) {
+    return res.redirect(
+      ok ? 302 : 303,
+      appendQueryParamsToUrl(redirectUri, {
+        provider: 'feishu',
+        status: ok ? 'success' : 'error',
+        message,
+        ...extraQuery
+      })
+    );
+  }
+
+  return res
+    .status(statusCode || (ok ? 200 : 400))
+    .type('html')
+    .send(`<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${ok ? '飞书绑定成功' : '飞书绑定失败'}</title>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 32px 20px; color: #1f2329; }
+    .card { max-width: 560px; margin: 0 auto; border: 1px solid #dce1e6; border-radius: 16px; padding: 24px; }
+    h1 { margin: 0 0 12px; font-size: 24px; }
+    p { margin: 0; line-height: 1.6; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>${ok ? '飞书账号已绑定' : '飞书账号绑定失败'}</h1>
+    <p>${escapeHtml(message)}</p>
+  </div>
+</body>
+</html>`);
+};
+
 // Auth middleware
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
@@ -894,6 +1206,223 @@ app.post('/api/auth/login', async (req, res) => {
   }
 });
 
+app.get('/api/auth/feishu/start', authenticateToken, async (req, res) => {
+  if (!isFeishuOAuthConfigured()) {
+    return res.status(503).json({ error: '飞书 OAuth 尚未配置完成，请先检查服务端环境变量' });
+  }
+
+  try {
+    const clientRedirectUri = normalizeOptionalUrl(
+      pickSingleValue(req.query.redirect_uri) ||
+      pickSingleValue(req.query.redirect) ||
+      ''
+    );
+    const state = buildFeishuStateToken({
+      userId: req.user.id,
+      clientRedirectUri
+    });
+
+    res.json({
+      authorizeUrl: buildFeishuAuthorizeUrl({ state }),
+      redirectUri: FEISHU_REDIRECT_URI,
+      scope: parseFeishuScopeList(FEISHU_OAUTH_SCOPES),
+      prompt: FEISHU_OAUTH_PROMPT || null,
+      expiresIn: FEISHU_STATE_TTL_SECONDS
+    });
+  } catch (error) {
+    console.error('Create Feishu authorize URL error:', error);
+    res.status(500).json({ error: '生成飞书授权链接失败' });
+  }
+});
+
+app.get('/api/auth/feishu/callback', async (req, res) => {
+  const rawState = pickSingleValue(req.query.state) || '';
+  const queryError = pickSingleValue(req.query.error) || '';
+  const code = pickSingleValue(req.query.code) || '';
+
+  let statePayload = null;
+  let successRedirectUri = normalizeOptionalUrl(FEISHU_OAUTH_SUCCESS_REDIRECT);
+  let failureRedirectUri = normalizeOptionalUrl(FEISHU_OAUTH_FAILURE_REDIRECT);
+
+  try {
+    statePayload = verifyFeishuStateToken(rawState);
+    const stateRedirectUri = normalizeOptionalUrl(statePayload.clientRedirectUri);
+    successRedirectUri = stateRedirectUri
+      || normalizeOptionalUrl(FEISHU_OAUTH_SUCCESS_REDIRECT);
+    failureRedirectUri = stateRedirectUri
+      || normalizeOptionalUrl(FEISHU_OAUTH_FAILURE_REDIRECT)
+      || successRedirectUri;
+  } catch (error) {
+    console.error('Verify Feishu state error:', error);
+    return sendFeishuOAuthResult(res, {
+      ok: false,
+      message: '飞书授权状态已失效，请重新发起绑定',
+      redirectUri: normalizeOptionalUrl(FEISHU_OAUTH_FAILURE_REDIRECT),
+      statusCode: 400
+    });
+  }
+
+  if (queryError) {
+    return sendFeishuOAuthResult(res, {
+      ok: false,
+      message: queryError === 'access_denied' ? '你已取消飞书授权' : `飞书授权失败：${queryError}`,
+      redirectUri: failureRedirectUri,
+      statusCode: 400
+    });
+  }
+
+  if (!code) {
+    return sendFeishuOAuthResult(res, {
+      ok: false,
+      message: '飞书回调缺少授权码，请重新发起绑定',
+      redirectUri: failureRedirectUri,
+      statusCode: 400
+    });
+  }
+
+  try {
+    const currentUser = await prisma.user.findUnique({
+      where: { id: statePayload.userId },
+      select: { id: true, email: true, name: true }
+    });
+
+    if (!currentUser) {
+      return sendFeishuOAuthResult(res, {
+        ok: false,
+        message: '当前漫旅账号不存在，无法完成飞书绑定',
+        redirectUri: failureRedirectUri,
+        statusCode: 404
+      });
+    }
+
+    const tokenPayload = await requestFeishuToken({
+      grant_type: 'authorization_code',
+      client_id: FEISHU_CLIENT_ID,
+      client_secret: FEISHU_CLIENT_SECRET,
+      code,
+      redirect_uri: FEISHU_REDIRECT_URI
+    });
+
+    const userInfo = await fetchFeishuUserInfo(tokenPayload.access_token);
+
+    if (!userInfo?.open_id) {
+      throw new Error('飞书用户信息缺少 open_id');
+    }
+
+    const conflictUser = await prisma.user.findFirst({
+      where: {
+        feishuOpenId: userInfo.open_id,
+        NOT: { id: statePayload.userId }
+      },
+      select: { id: true }
+    });
+
+    if (conflictUser) {
+      return sendFeishuOAuthResult(res, {
+        ok: false,
+        message: '该飞书账号已绑定其他漫旅账号，请先解绑后再试',
+        redirectUri: failureRedirectUri,
+        statusCode: 409
+      });
+    }
+
+    await prisma.user.update({
+      where: { id: statePayload.userId },
+      data: buildFeishuBindingUpdateData(tokenPayload, userInfo)
+    });
+
+    return sendFeishuOAuthResult(res, {
+      ok: true,
+      message: '飞书账号绑定成功',
+      redirectUri: successRedirectUri
+    });
+  } catch (error) {
+    console.error('Feishu OAuth callback error:', error?.details || error);
+    return sendFeishuOAuthResult(res, {
+      ok: false,
+      message: error.message || '飞书绑定失败，请稍后重试',
+      redirectUri: failureRedirectUri,
+      statusCode: 500
+    });
+  }
+});
+
+app.get('/api/auth/feishu/status', authenticateToken, async (req, res) => {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: FEISHU_BINDING_SELECT
+    });
+
+    if (!user) {
+      return res.status(404).json({ error: '用户不存在' });
+    }
+
+    if (!isFeishuOAuthConfigured()) {
+      return res.json(buildFeishuBindingStatus(user, {
+        error: '飞书 OAuth 尚未配置完成'
+      }));
+    }
+
+    let latestBinding = user;
+    let refreshError = '';
+
+    if (
+      latestBinding.feishuOpenId &&
+      latestBinding.feishuAccessToken &&
+      isDateExpired(latestBinding.feishuAccessTokenExpiresAt, FEISHU_TOKEN_REFRESH_SKEW_MS) &&
+      latestBinding.feishuRefreshToken
+    ) {
+      try {
+        latestBinding = await refreshFeishuAccessTokenForUser(latestBinding);
+      } catch (error) {
+        refreshError = error.message || '飞书 access_token 刷新失败';
+        console.error('Refresh Feishu token error:', error?.details || error);
+      }
+    }
+
+    res.json(buildFeishuBindingStatus(latestBinding, {
+      refreshError: refreshError || undefined
+    }));
+  } catch (error) {
+    console.error('Get Feishu status error:', error);
+    res.status(500).json({ error: '获取飞书绑定状态失败' });
+  }
+});
+
+app.post('/api/auth/feishu/unbind', authenticateToken, async (req, res) => {
+  try {
+    const updatedUser = await prisma.user.update({
+      where: { id: req.user.id },
+      data: {
+        feishuOpenId: null,
+        feishuUnionId: null,
+        feishuUserId: null,
+        feishuTenantKey: null,
+        feishuName: null,
+        feishuEmail: null,
+        feishuAvatarUrl: null,
+        feishuAccessToken: null,
+        feishuRefreshToken: null,
+        feishuScope: null,
+        feishuTokenType: null,
+        feishuAccessTokenExpiresAt: null,
+        feishuRefreshTokenExpiresAt: null,
+        feishuConnectedAt: null
+      },
+      select: FEISHU_BINDING_SELECT
+    });
+
+    res.json({
+      message: '飞书账号已解除绑定',
+      feishu: buildFeishuBindingStatus(updatedUser)
+    });
+  } catch (error) {
+    console.error('Unbind Feishu account error:', error);
+    res.status(500).json({ error: '解除飞书绑定失败' });
+  }
+});
+
 // Reset Password
 app.post('/api/auth/reset-password', async (req, res) => {
   try {
@@ -936,7 +1465,8 @@ app.get('/api/user', authenticateToken, async (req, res) => {
       name: user.name, 
       major: user.major,
       memorySummary: user.memorySummary || '',
-      memoryFacts: normalizeMemoryFacts(user.memoryFacts)
+      memoryFacts: normalizeMemoryFacts(user.memoryFacts),
+      feishu: buildFeishuBindingStatus(user)
     });
   } catch (error) {
     res.status(500).json({ error: 'Server error' });
@@ -969,7 +1499,8 @@ app.put('/api/user', authenticateToken, async (req, res) => {
         name: updatedUser.name,
         major: updatedUser.major,
         memorySummary: updatedUser.memorySummary || '',
-        memoryFacts: normalizeMemoryFacts(updatedUser.memoryFacts)
+        memoryFacts: normalizeMemoryFacts(updatedUser.memoryFacts),
+        feishu: buildFeishuBindingStatus(updatedUser)
       } 
     });
   } catch (error) {
