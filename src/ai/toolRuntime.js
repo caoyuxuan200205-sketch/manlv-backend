@@ -679,6 +679,9 @@ const createToolRuntime = ({
   const getTencentNewsConfiguredInstallRoot = () => {
     const configuredRoot = String(process.env.TENCENT_NEWS_INSTALL || '').trim();
     if (configuredRoot) return configuredRoot;
+    if (process.platform === 'linux') {
+      return `${process.cwd().replace(/\\/g, '/')}/.tencent-news-cli`;
+    }
     return `${os.homedir()}/.tencent-news-cli`;
   };
 

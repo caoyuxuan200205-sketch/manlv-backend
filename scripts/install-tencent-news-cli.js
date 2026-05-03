@@ -6,7 +6,9 @@ const { execFileSync } = require('child_process');
 const isLinux = process.platform === 'linux';
 const installScriptUrl = 'https://mat1.gtimg.com/qqcdn/qqnews/cli/hub/tencent-news/setup.sh';
 const binaryName = 'tencent-news-cli';
-const defaultInstallRoot = path.join(os.homedir(), '.tencent-news-cli');
+const defaultInstallRoot = isLinux
+  ? path.resolve(process.cwd(), '.tencent-news-cli')
+  : path.join(os.homedir(), '.tencent-news-cli');
 const installRoot = process.env.TENCENT_NEWS_INSTALL || defaultInstallRoot;
 const installedCliPath = path.join(installRoot, 'bin', binaryName);
 const envCliPath = String(process.env.TENCENT_NEWS_CLI_PATH || '').trim();
