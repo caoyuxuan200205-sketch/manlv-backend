@@ -1,5 +1,10 @@
 const crypto = require('crypto');
+const os = require('os');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const jwt = require('jsonwebtoken');
+
+const execFileAsync = promisify(execFile);
 
 const FEISHU_CLIENT_ID = (process.env.FEISHU_CLIENT_ID || '').trim();
 const FEISHU_CLIENT_SECRET = (process.env.FEISHU_CLIENT_SECRET || '').trim();
@@ -10,6 +15,12 @@ const FEISHU_OAUTH_SUCCESS_REDIRECT = (process.env.FEISHU_OAUTH_SUCCESS_REDIRECT
 const FEISHU_AUTHORIZE_URL = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize';
 const FEISHU_STATE_TTL_SECONDS = 10 * 60;
 const FEISHU_TOKEN_REFRESH_SKEW_MS = 60 * 1000;
+const TENCENT_NEWS_API_KEY_URL = 'https://news.qq.com/exchange?scene=appkey';
+const TENCENT_NEWS_WINDOWS_INSTALL_URL = 'https://mat1.gtimg.com/qqcdn/qqnews/cli/hub/tencent-news/setup.ps1';
+const TENCENT_NEWS_UNIX_INSTALL_URL = 'https://mat1.gtimg.com/qqcdn/qqnews/cli/hub/tencent-news/setup.sh';
+const TENCENT_NEWS_API_KEY_MISSING_PATTERN = /未设置\s*API\s*Key|api key.*not set|apikey.*not set|not set/i;
+const TENCENT_NEWS_DEFAULT_TIMEOUT_MS = 15000;
+const TENCENT_NEWS_MAX_LIMIT = 20;
 
 const FEISHU_BINDING_SELECT = {
   id: true,
@@ -224,6 +235,55 @@ const createToolRuntime = ({
             query: { type: 'string', description: '搜索关键词，例如 2024清华计算机夏令营通知' }
           },
           required: ['query'],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tencent_news_search',
+        description: '通过腾讯新闻官方 CLI 搜索新闻。适合查询热点事件、时政、科技、教育或指定关键词新闻。',
+        parameters: {
+          type: 'object',
+          properties: {
+            query: { type: 'string', description: '新闻搜索关键词，例如 保研 政策、人工智能、教育部' },
+            limit: { type: 'integer', description: '返回条数，建议 1-10，最大 20' }
+          },
+          required: ['query'],
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tencent_news_hot',
+        description: '通过腾讯新闻官方 CLI 获取当前热点新闻榜单。',
+        parameters: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', description: '返回条数，建议 1-10，最大 20' }
+          },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'tencent_news_briefing',
+        description: '通过腾讯新闻官方 CLI 获取今日早报或晚报。',
+        parameters: {
+          type: 'object',
+          properties: {
+            period: {
+              type: 'string',
+              enum: ['morning', 'evening'],
+              description: 'morning=早报，evening=晚报'
+            }
+          },
+          required: ['period'],
           additionalProperties: false
         }
       }
@@ -593,6 +653,181 @@ const createToolRuntime = ({
     };
   };
 
+  const tencentNewsCliPathFromEnv = String(process.env.TENCENT_NEWS_CLI_PATH || '').trim();
+  const tencentNewsApiKey = String(process.env.TENCENT_NEWS_API_KEY || '').trim();
+  const tencentNewsCaller = String(process.env.TENCENT_NEWS_CALLER || 'manlv-backend').trim() || 'manlv-backend';
+  const parsedTencentNewsTimeoutMs = Number(process.env.TENCENT_NEWS_TIMEOUT_MS);
+  const tencentNewsTimeoutMs = Number.isFinite(parsedTencentNewsTimeoutMs) && parsedTencentNewsTimeoutMs >= 3000
+    ? parsedTencentNewsTimeoutMs
+    : TENCENT_NEWS_DEFAULT_TIMEOUT_MS;
+
+  let cachedTencentNewsCliPath = '';
+  let cachedTencentNewsApiKeyConfigured = false;
+
+  const clampTencentNewsLimit = (value, defaultValue = 10) => {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return defaultValue;
+    return Math.max(1, Math.min(TENCENT_NEWS_MAX_LIMIT, Math.floor(parsed)));
+  };
+
+  const getTencentNewsInstallHint = () => (
+    process.platform === 'win32'
+      ? `请先在 PowerShell 中执行: irm ${TENCENT_NEWS_WINDOWS_INSTALL_URL} | iex`
+      : `请先执行: curl -fsSL ${TENCENT_NEWS_UNIX_INSTALL_URL} | sh`
+  );
+
+  const getTencentNewsConfiguredInstallRoot = () => {
+    const configuredRoot = String(process.env.TENCENT_NEWS_INSTALL || '').trim();
+    if (configuredRoot) return configuredRoot;
+    return `${os.homedir()}/.tencent-news-cli`;
+  };
+
+  const getTencentNewsCliCandidates = () => {
+    const installRoot = getTencentNewsConfiguredInstallRoot().replace(/\\/g, '/');
+    const defaultCliPath = process.platform === 'win32'
+      ? `${installRoot}/bin/tencent-news-cli.exe`
+      : `${installRoot}/bin/tencent-news-cli`;
+
+    const candidates = [
+      tencentNewsCliPathFromEnv,
+      defaultCliPath,
+      process.platform === 'win32' ? 'tencent-news-cli.exe' : 'tencent-news-cli'
+    ]
+      .map((item) => String(item || '').trim())
+      .filter(Boolean);
+
+    return [...new Set(candidates)];
+  };
+
+  const formatTencentNewsCliFailure = (result, cliPath) => {
+    const output = String(result?.output || '').trim();
+    if (result?.notFound) {
+      return `未找到腾讯新闻 CLI。${getTencentNewsInstallHint()}`;
+    }
+    if (TENCENT_NEWS_API_KEY_MISSING_PATTERN.test(output)) {
+      return `腾讯新闻 API Key 未配置。请先访问 ${TENCENT_NEWS_API_KEY_URL} 获取 API Key，并在服务端配置 TENCENT_NEWS_API_KEY。`;
+    }
+    if (result?.timedOut) {
+      return `腾讯新闻 CLI 调用超时（>${tencentNewsTimeoutMs}ms），请稍后重试。`;
+    }
+    return output || `腾讯新闻 CLI 调用失败: ${cliPath}`;
+  };
+
+  const runTencentNewsCli = async (cliPath, args, { allowFailure = false } = {}) => {
+    try {
+      const { stdout, stderr } = await execFileAsync(cliPath, args, {
+        timeout: tencentNewsTimeoutMs,
+        maxBuffer: 1024 * 1024 * 5,
+        windowsHide: true
+      });
+
+      const combinedOutput = [stdout, stderr]
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+
+      return {
+        ok: true,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || ''),
+        output: combinedOutput
+      };
+    } catch (error) {
+      const stdout = String(error?.stdout || '');
+      const stderr = String(error?.stderr || '');
+      const combinedOutput = [stdout, stderr, error?.message]
+        .map((item) => String(item || '').trim())
+        .filter(Boolean)
+        .join('\n')
+        .trim();
+
+      const result = {
+        ok: false,
+        stdout,
+        stderr,
+        output: combinedOutput,
+        exitCode: typeof error?.code === 'number' ? error.code : null,
+        notFound: error?.code === 'ENOENT',
+        timedOut: error?.killed === true && error?.signal === 'SIGTERM'
+      };
+
+      if (allowFailure) {
+        return result;
+      }
+
+      throw new Error(formatTencentNewsCliFailure(result, cliPath));
+    }
+  };
+
+  const resolveTencentNewsCliPath = async () => {
+    if (cachedTencentNewsCliPath) return cachedTencentNewsCliPath;
+
+    const candidates = getTencentNewsCliCandidates();
+    let lastFailure = null;
+
+    for (const candidate of candidates) {
+      const result = await runTencentNewsCli(candidate, ['help'], { allowFailure: true });
+      if (result.ok) {
+        cachedTencentNewsCliPath = candidate;
+        return candidate;
+      }
+      lastFailure = { candidate, result };
+      if (!result.notFound) {
+        throw new Error(formatTencentNewsCliFailure(result, candidate));
+      }
+    }
+
+    if (lastFailure) {
+      throw new Error(formatTencentNewsCliFailure(lastFailure.result, lastFailure.candidate));
+    }
+
+    throw new Error(`未找到腾讯新闻 CLI。${getTencentNewsInstallHint()}`);
+  };
+
+  const ensureTencentNewsApiKeyConfigured = async (cliPath) => {
+    if (cachedTencentNewsApiKeyConfigured) return;
+
+    if (!tencentNewsApiKey) {
+      throw new Error(`缺少 TENCENT_NEWS_API_KEY 配置。请先访问 ${TENCENT_NEWS_API_KEY_URL} 获取 API Key。`);
+    }
+
+    const keyState = await runTencentNewsCli(cliPath, ['apikey-get'], { allowFailure: true });
+    if (keyState.ok && !TENCENT_NEWS_API_KEY_MISSING_PATTERN.test(keyState.output)) {
+      cachedTencentNewsApiKeyConfigured = true;
+      return;
+    }
+
+    if (!keyState.ok && !TENCENT_NEWS_API_KEY_MISSING_PATTERN.test(keyState.output)) {
+      throw new Error(formatTencentNewsCliFailure(keyState, cliPath));
+    }
+
+    const setResult = await runTencentNewsCli(cliPath, ['apikey-set', tencentNewsApiKey], { allowFailure: true });
+    if (!setResult.ok) {
+      throw new Error(formatTencentNewsCliFailure(setResult, cliPath));
+    }
+
+    cachedTencentNewsApiKeyConfigured = true;
+  };
+
+  const executeTencentNewsCommand = async (subcommand, commandArgs = []) => {
+    const cliPath = await resolveTencentNewsCliPath();
+    await ensureTencentNewsApiKeyConfigured(cliPath);
+
+    const args = [subcommand, ...commandArgs, '--caller', tencentNewsCaller];
+    const result = await runTencentNewsCli(cliPath, args, { allowFailure: true });
+    if (!result.ok) {
+      throw new Error(formatTencentNewsCliFailure(result, cliPath));
+    }
+
+    return {
+      provider: 'tencent-news-cli',
+      subcommand,
+      caller: tencentNewsCaller,
+      text: result.output || result.stdout || ''
+    };
+  };
+
   const BAZI_DISCLAIMER =
     '仅供传统文化学习与娱乐参考，不构成医疗、法律、财务、升学或人生决策建议。';
 
@@ -929,6 +1164,49 @@ const createToolRuntime = ({
         return { ok: true, data: searchResults };
       } catch (error) {
         return { ok: false, error: error.message || '联网搜索失败' };
+      }
+    }
+
+    if (name === 'tencent_news_search') {
+      const { query, limit } = args || {};
+      if (!query || typeof query !== 'string') {
+        return { ok: false, error: 'query 参数缺失或格式错误' };
+      }
+      try {
+        const result = await executeTencentNewsCommand('search', [
+          query.trim(),
+          '--limit',
+          String(clampTencentNewsLimit(limit))
+        ]);
+        return { ok: true, data: result };
+      } catch (error) {
+        return { ok: false, error: error.message || '腾讯新闻搜索失败' };
+      }
+    }
+
+    if (name === 'tencent_news_hot') {
+      const { limit } = args || {};
+      try {
+        const result = await executeTencentNewsCommand('hot', [
+          '--limit',
+          String(clampTencentNewsLimit(limit))
+        ]);
+        return { ok: true, data: result };
+      } catch (error) {
+        return { ok: false, error: error.message || '腾讯新闻热点获取失败' };
+      }
+    }
+
+    if (name === 'tencent_news_briefing') {
+      const period = String(args?.period || '').trim().toLowerCase();
+      if (!['morning', 'evening'].includes(period)) {
+        return { ok: false, error: 'period 参数必须为 morning 或 evening' };
+      }
+      try {
+        const result = await executeTencentNewsCommand(period, []);
+        return { ok: true, data: result };
+      } catch (error) {
+        return { ok: false, error: error.message || '腾讯新闻简报获取失败' };
       }
     }
 
