@@ -35,7 +35,7 @@
 | 数据库 | PostgreSQL |
 | 认证 | JWT · bcryptjs |
 | AI | Qwen-Plus / Qwen-Max（DashScope，兼容 OpenAI 格式）|
-| 第三方集成 | 飞书 OpenAPI · Tavily 联网搜索 · 高德地图 API |
+| 第三方集成 | 飞书 OpenAPI · Tavily 联网搜索 · 高德地图 API · 美团酒旅 Skill |
 | 流式输出 | SSE（Server-Sent Events）|
 
 ---
@@ -91,6 +91,7 @@ AI_API_KEY=sk-xxxxxxxxxxxxxxxx
 AI_MODEL=qwen-plus
 AI_MAX_STEPS=6
 TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxx
+MEITUAN_TRAVEL_TOKEN=e48dbac7e2cef4e020adcdf5950e6f86c68bb2592927c73034b29d89e016cd59
 MCP_SERVERS_JSON=[{"name":"filesystem","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","C:\\\\Users\\\\24203\\\\Desktop\\\\ManLv"]}]
 
 # AI 系统提示词（可选，有默认值）
@@ -393,7 +394,8 @@ Authorization: Bearer <token>
 | `create_interview` | 创建新的面试记录 |
 | `analyze_schedule_conflicts` | 分析同日行程冲突 |
 | `get_weather` | 查询指定城市的天气信息 |
-| `search_hotels` | 搜索目的地周边酒店 |
+| `meituan_travel_query` | **(首选)** 美团酒旅真实供给查询（酒店、机票、火车票、门票等） |
+| `search_hotels` | 搜索目的地周边酒店（备用，优先使用美团工具） |
 | `web_search` | 联网搜索最新保研资讯与动态 |
 | `bazi_reading` | 传统文化命理排盘与陪伴 |
 | `lark_auth_*` | 飞书 OAuth 账号绑定与状态检查 |
@@ -504,6 +506,10 @@ CMD ["node", "src/server.js"]
 
 ## 📝 更新日志
 
+- **v1.1.0** (2024-05-06)
+  - 深度集成美团酒旅 Skill，支持真实酒店、票务数据查询
+  - 优化 AI Tool Routing 策略，强制优先调度高保真业务工具
+  - 完善线上无状态部署环境兼容性
 - **v1.0.0** (2024-04-27)
   - 初始版本发布
   - 支持用户认证、邮件管理、面试安排
@@ -586,7 +592,7 @@ model Email {
 | 版本 | 计划功能 |
 |------|----------|
 | V1.x | 天气查询工具 · 多轮对话持久化 · 对话历史存储 |
-| V2.0 | 邮箱 OAuth 授权 · NLP 邮件解析 · 票务酒店 API 接入 |
+| V2.0 | 飞书 OAuth 绑定 · 飞书文档/日程集成 · 美团酒旅真实 API 接入 (已完成) |
 | V3.0 | 导师知识图谱 · 城市学习内容生成 · 情绪监测系统 |
 
 ---
