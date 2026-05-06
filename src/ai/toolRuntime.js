@@ -212,7 +212,7 @@ const createToolRuntime = ({
       type: 'function',
       function: {
         name: 'search_hotels',
-        description: '搜索指定城市或地点周边的酒店信息',
+        description: '【已降级：搜索酒店请首选 meituan_travel_query】搜索指定城市或地点周边的酒店信息。仅当美团工具不可用时作为备用。',
         parameters: {
           type: 'object',
           properties: {
@@ -477,6 +477,22 @@ const createToolRuntime = ({
             pageAll: { type: 'boolean', description: '是否自动翻页' },
             pageLimit: { type: 'integer', description: '自动翻页页数上限' }
           },
+          additionalProperties: false
+        }
+      }
+    },
+    {
+      type: 'function',
+      function: {
+        name: 'meituan_travel_query',
+        description: '【首选工具：强制优先】基于美团酒旅供给，处理旅游出行需求。只要用户提到【搜酒店、订酒店、景点、门票、机火、旅行攻略】，必须【无条件优先调用本工具】。适合查询：XX周边酒店预订、周末去哪玩等。',
+        parameters: {
+          type: 'object',
+          properties: {
+            city: { type: 'string', description: '当前定位城市或查询的目标城市，默认北京' },
+            query: { type: 'string', description: '用户的自然语言查询需求，例如：帮我推荐几个必去景点' }
+          },
+          required: ['city', 'query'],
           additionalProperties: false
         }
       }
@@ -1417,6 +1433,43 @@ const createToolRuntime = ({
         });
       } catch (error) {
         return { ok: false, error: error.message };
+      }
+    }
+
+    if (name === 'meituan_travel_query') {
+      const { city, query } = args || {};
+      if (!city || !query) {
+        return { ok: false, error: 'city 或 query 参数缺失' };
+      }
+      try {
+        const mtToken = process.env.MEITUAN_TRAVEL_TOKEN;
+        if (!mtToken) {
+          return { ok: false, error: '服务端未配置 MEITUAN_TRAVEL_TOKEN 环境变量' };
+        }
+        
+        // 动态注入 config.json 以兼容 Vercel/Railway 等线上无状态部署环境
+        const fs = require('fs');
+        const path = require('path');
+        const mtConfigDir = path.join(os.homedir(), '.config', 'meituan-travel');
+        await fs.promises.mkdir(mtConfigDir, { recursive: true });
+        await fs.promises.writeFile(path.join(mtConfigDir, 'config.json'), JSON.stringify({ key: mtToken }), 'utf-8');
+
+        const { stdout, stderr } = await execFileAsync('npx', [
+          '-p', '@meituan-travel/travel-cli', 'mttravel',
+          city.trim(), query.trim()
+        ], {
+          timeout: 120000,
+          maxBuffer: 1024 * 1024 * 10,
+          windowsHide: true,
+          shell: process.platform === 'win32'
+        });
+        const output = [stdout, stderr].map(String).filter(Boolean).join('\n');
+        return { ok: true, data: { result: output } };
+      } catch (error) {
+        const stdout = String(error?.stdout || '');
+        const stderr = String(error?.stderr || '');
+        const output = [stdout, stderr, error?.message].map(String).filter(Boolean).join('\n');
+        return { ok: false, error: output || '美团酒旅查询失败' };
       }
     }
 
