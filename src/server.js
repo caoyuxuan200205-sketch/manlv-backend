@@ -354,8 +354,6 @@ const corsOptions = {
   optionsSuccessStatus: 200, // 部分旧版浏览器（IE11）对 204 处理有问题
 };
 app.use(cors(corsOptions));
-// 显式响应所有 OPTIONS 预检请求
-app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // 配置文件上传
