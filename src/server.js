@@ -1,4 +1,4 @@
-﻿﻿﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
@@ -15,6 +15,10 @@ const { createToolRuntime } = require('./ai/toolRuntime');
 const { createPromptRuntime } = require('./ai/promptRuntime');
 const { createAiChatHandler } = require('./ai/chatHandler');
 const { createLarkApiRuntime } = require('./ai/larkApiRuntime');
+const { encrypt, decrypt } = require('./utils/crypto');
+const { testImapConnection, fetchEmailsFromImap, resolveImapHost } = require('./services/emailFetcher');
+const { parseEmailWithAI } = require('./services/emailAiParser');
+const { sendEmailViaSmtp } = require('./services/emailSender');
 require('dotenv').config();
 
 const app = express();
@@ -337,7 +341,21 @@ const AI_SYSTEM_PROMPT_INTERVIEWER =
 如果简历信息不足以支撑个性化切入，再退一步要求考生做简洁版自我介绍。`;
 
 // Middleware
-app.use(cors());
+const corsOptions = {
+  origin: [
+    'https://www.manlvai.site',
+    'https://manlvai.site',
+    'http://localhost:3000',
+    'http://localhost:3001',
+  ],
+  methods: ['GET', 'HEAD', 'PUT', 'PATCH', 'POST', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true,
+  optionsSuccessStatus: 200, // 部分旧版浏览器（IE11）对 204 处理有问题
+};
+app.use(cors(corsOptions));
+// 显式响应所有 OPTIONS 预检请求
+app.options('*', cors(corsOptions));
 app.use(express.json());
 
 // 配置文件上传
@@ -850,7 +868,8 @@ const aiChatHandler = createAiChatHandler({
   getAiTools,
   aiAgentGraph,
   deriveMemoryPatch,
-  upsertUserMemory
+  upsertUserMemory,
+  prisma
 });
 
 const FEISHU_BINDING_SELECT = {
@@ -1603,7 +1622,418 @@ app.put('/api/user/memory', authenticateToken, async (req, res) => {
   }
 });
 
-// CRUD for Emails
+// CRUD for Email Accounts & Emails
+
+// 获取当前绑定的邮箱列表
+app.get('/api/email-accounts', authenticateToken, async (req, res) => {
+  try {
+    const accounts = await prisma.userEmailAccount.findMany({
+      where: { userId: req.user.id },
+      select: {
+        id: true,
+        provider: true,
+        email: true,
+        host: true,
+        port: true,
+        lastSyncedAt: true,
+        lastSyncStatus: true,
+        lastSyncError: true,
+        createdAt: true
+      }
+    });
+    res.json(accounts);
+  } catch (error) {
+    console.error('Get email accounts error:', error);
+    res.status(500).json({ error: '获取邮箱绑定列表失败' });
+  }
+});
+
+// 绑定/测试邮箱账户 (QQ/163)
+app.post('/api/email-accounts/bind', authenticateToken, async (req, res) => {
+  try {
+    const { provider, email, authCode } = req.body;
+    if (!email || !authCode) {
+      return res.status(400).json({ error: '请提供完整的邮箱账号和授权码' });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const cleanAuthCode = authCode.trim();
+
+    // 测试 IMAP 握手与密码
+    console.log(`[IMAP Test Connecting] ${cleanEmail}...`);
+    const testResult = await testImapConnection({
+      provider: provider || 'qq',
+      email: cleanEmail,
+      authCode: cleanAuthCode
+    });
+
+    if (!testResult.ok) {
+      return res.status(400).json({ error: testResult.error || 'IMAP 连接失败，请检查授权码' });
+    }
+
+    const encryptedAuthCode = encrypt(cleanAuthCode);
+    const hostInfo = resolveImapHost(provider, cleanEmail);
+
+    const account = await prisma.userEmailAccount.upsert({
+      where: {
+        userId_email: {
+          userId: req.user.id,
+          email: cleanEmail
+        }
+      },
+      update: {
+        provider: provider || 'qq',
+        authCodeEncrypted: encryptedAuthCode,
+        host: hostInfo.host,
+        port: hostInfo.port,
+        secure: hostInfo.secure,
+        lastSyncStatus: 'connected',
+        lastSyncError: null
+      },
+      create: {
+        userId: req.user.id,
+        provider: provider || 'qq',
+        email: cleanEmail,
+        authCodeEncrypted: encryptedAuthCode,
+        host: hostInfo.host,
+        port: hostInfo.port,
+        secure: hostInfo.secure,
+        lastSyncStatus: 'connected'
+      },
+      select: {
+        id: true,
+        provider: true,
+        email: true,
+        host: true,
+        port: true,
+        createdAt: true
+      }
+    });
+
+    res.json({
+      message: '邮箱验证成功，已成功绑定',
+      account
+    });
+  } catch (error) {
+    console.error('Bind email account error:', error);
+    res.status(500).json({ error: '绑定邮箱失败: ' + error.message });
+  }
+});
+
+// 解绑邮箱
+app.delete('/api/email-accounts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await prisma.userEmailAccount.delete({
+      where: { id, userId: req.user.id }
+    });
+    res.json({ message: '已解除邮箱绑定' });
+  } catch (error) {
+    console.error('Unbind email account error:', error);
+    res.status(500).json({ error: '解绑失败' });
+  }
+});
+
+// 清空已有邮件缓存并重置抓取记录
+app.post('/api/emails/reset', authenticateToken, async (req, res) => {
+  try {
+    // 清空用户存储的所有 Email
+    await prisma.email.deleteMany({
+      where: { userId: req.user.id }
+    });
+
+    // 重置所有绑定的 EmailAccount 的 lastUid
+    await prisma.userEmailAccount.updateMany({
+      where: { userId: req.user.id },
+      data: {
+        lastUid: 0,
+        lastSyncedAt: null,
+        lastSyncStatus: 'reset'
+      }
+    });
+
+    res.json({ message: '已成功清空邮件缓存与同步记录，可重新全量抓取' });
+  } catch (error) {
+    console.error('Reset emails error:', error);
+    res.status(500).json({ error: '清空失败: ' + error.message });
+  }
+});
+
+// 自动同步解析出的保研邮件通知到用户的 Interview 行程列表
+async function syncEmailToInterviewSchedule(userId, parsedData) {
+  if (!parsedData || !parsedData.isPostgradNotice || !parsedData.school || parsedData.school === '未知院校') {
+    return null;
+  }
+
+  // 提取日期 (如 "7月13日" 或 "2026-07-13")
+  let eventDate = new Date();
+  if (parsedData.dates && parsedData.dates.startDate) {
+    const rawDateStr = parsedData.dates.startDate;
+    const match = rawDateStr.match(/(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日/);
+    if (match) {
+      const year = match[1] ? parseInt(match[1]) : new Date().getFullYear();
+      const month = parseInt(match[2]) - 1;
+      const day = parseInt(match[3]);
+      eventDate = new Date(year, month, day);
+    }
+  }
+
+  const eventTypeLabel = parsedData.eventType === 'camp' ? '夏令营' : parsedData.eventType === 'promotion' ? '预推免' : '面试';
+
+  // 检查是否存在同名高校行程
+  const existingInterview = await prisma.interview.findFirst({
+    where: {
+      userId,
+      school: parsedData.school,
+      type: eventTypeLabel
+    }
+  });
+
+  if (!existingInterview) {
+    console.log(`[Auto Sync to Schedule] Adding Interview Schedule for ${parsedData.school}`);
+    return await prisma.interview.create({
+      data: {
+        userId,
+        school: parsedData.school,
+        major: parsedData.college || '建筑与城市规划',
+        date: eventDate,
+        city: parsedData.location || '线上活动',
+        type: eventTypeLabel
+      }
+    });
+  } else {
+    console.log(`[Auto Sync to Schedule] Updating Interview Schedule for ${parsedData.school}`);
+    return await prisma.interview.update({
+      where: { id: existingInterview.id },
+      data: {
+        major: parsedData.college || existingInterview.major,
+        date: eventDate,
+        city: parsedData.location || existingInterview.city,
+        type: eventTypeLabel
+      }
+    });
+  }
+}
+
+// 触发同步真实的邮箱邮件（快存落库 + 后台 AI 异步精细解析，支持 reset 重置全量拉取）
+app.post('/api/emails/sync', authenticateToken, async (req, res) => {
+  try {
+    const isReset = Boolean(req.body?.reset);
+
+    if (isReset) {
+      await prisma.email.deleteMany({
+        where: { userId: req.user.id }
+      });
+      await prisma.userEmailAccount.updateMany({
+        where: { userId: req.user.id },
+        data: { lastUid: 0 }
+      });
+    }
+
+    const accounts = await prisma.userEmailAccount.findMany({
+      where: { userId: req.user.id }
+    });
+
+    if (accounts.length === 0) {
+      return res.status(400).json({ error: '您尚未绑定邮箱，请先绑定 QQ 邮箱或 163 邮箱' });
+    }
+
+    let newlyInsertedEmails = [];
+
+    for (const account of accounts) {
+      console.log(`[Fast IMAP Syncing${isReset ? ' (Reset Mode)' : ''}] ${account.email}...`);
+      const accountConfig = isReset ? { ...account, lastUid: 0 } : account;
+      const fetchResult = await fetchEmailsFromImap(accountConfig, { limit: 20 });
+
+      if (!fetchResult.success) {
+        await prisma.userEmailAccount.update({
+          where: { id: account.id },
+          data: {
+            lastSyncStatus: 'failed',
+            lastSyncError: fetchResult.error,
+            lastSyncedAt: new Date()
+          }
+        });
+        continue;
+      }
+
+      for (const rawEmail of fetchResult.emails) {
+        const existing = await prisma.email.findFirst({
+          where: {
+            userId: req.user.id,
+            OR: [
+              { uid: rawEmail.uid, emailAccountId: account.id },
+              { messageId: rawEmail.messageId }
+            ]
+          }
+        });
+
+        if (existing) {
+          continue;
+        }
+
+        // 使用规则与黑白名单检查是否为保研/夏令营/预推免相关邮件
+        const initialParsedData = require('./services/emailAiParser').fallbackRuleBasedParser(rawEmail.subject, rawEmail.body);
+
+        // 如果不是保研相关邮件（如阿里巴巴校招、ChatGPT广告、个人求职），严格拦截不予落库
+        if (!initialParsedData.isPostgradNotice) {
+          console.log(`[Filtered Non-Postgrad Email] 主题: ${rawEmail.subject}`);
+          continue;
+        }
+
+        const createdEmail = await prisma.email.create({
+          data: {
+            userId: req.user.id,
+            emailAccountId: account.id,
+            uid: rawEmail.uid,
+            messageId: rawEmail.messageId,
+            subject: rawEmail.subject,
+            body: rawEmail.body,
+            html: rawEmail.html,
+            sender: rawEmail.sender,
+            receivedAt: rawEmail.receivedAt,
+            parsedData: initialParsedData
+          }
+        });
+
+        // 自动同步到用户的行程表
+        await syncEmailToInterviewSchedule(req.user.id, initialParsedData);
+
+        newlyInsertedEmails.push(createdEmail);
+      }
+
+      // 更新账号最新同步状态与 UID
+      await prisma.userEmailAccount.update({
+        where: { id: account.id },
+        data: {
+          lastSyncedAt: new Date(),
+          lastSyncStatus: 'success',
+          lastSyncError: null,
+          lastUid: fetchResult.highestUid
+        }
+      });
+    }
+
+    // 立即查询并响应客户端（毫秒级响应，无需等待大模型耗时）
+    const allEmails = await prisma.email.findMany({
+      where: { userId: req.user.id },
+      orderBy: { receivedAt: 'desc' }
+    });
+
+    res.json({
+      message: newlyInsertedEmails.length > 0 
+        ? `成功同步 ${newlyInsertedEmails.length} 封邮件，行程已同步更新！` 
+        : (isReset ? '收件箱暂未找到最近 30 天的邮件' : '邮件已是最新状态'),
+      syncedCount: newlyInsertedEmails.length,
+      totalCount: allEmails.length,
+      emails: allEmails
+    });
+
+    // 【后台异步】开启 AI 大模型深层精细结构化提取并刷新行程
+    if (newlyInsertedEmails.length > 0) {
+      setImmediate(async () => {
+        for (const mailItem of newlyInsertedEmails) {
+          try {
+            console.log(`[Background LLM Parsing] ID: ${mailItem.id}, 主题: ${mailItem.subject}`);
+            const aiParsedData = await parseEmailWithAI(mailItem.subject, mailItem.body);
+            if (aiParsedData) {
+              await prisma.email.update({
+                where: { id: mailItem.id },
+                data: { parsedData: aiParsedData }
+              });
+              await syncEmailToInterviewSchedule(req.user.id, aiParsedData);
+              console.log(`[Background LLM Completed & Synced to Schedule] ID: ${mailItem.id}`);
+            }
+          } catch (bgErr) {
+            console.error(`[Background LLM Error] ID: ${mailItem.id}:`, bgErr);
+          }
+        }
+      });
+    }
+
+  } catch (error) {
+    console.error('Sync emails error:', error);
+    res.status(500).json({ error: '同步抓取邮件失败: ' + error.message });
+  }
+});
+
+// 重解析单封邮件
+app.post('/api/emails/:id/reparse', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const email = await prisma.email.findFirst({
+      where: { id, userId: req.user.id }
+    });
+
+    if (!email) {
+      return res.status(404).json({ error: '邮件不存在' });
+    }
+
+    const newParsedData = await parseEmailWithAI(email.subject, email.body);
+    const updated = await prisma.email.update({
+      where: { id },
+      data: { parsedData: newParsedData }
+    });
+
+    // 自动同步/更新到用户的行程列表
+    await syncEmailToInterviewSchedule(req.user.id, newParsedData);
+
+    res.json(updated);
+  } catch (error) {
+    console.error('Reparse email error:', error);
+    res.status(500).json({ error: '重新解析邮件失败' });
+  }
+});
+
+// 使用用户绑定的邮箱通过 SMTP 真实发送回复邮件
+app.post('/api/emails/send-reply', authenticateToken, async (req, res) => {
+  try {
+    const { to, subject, content, emailAccountId } = req.body;
+    if (!to || !content) {
+      return res.status(400).json({ error: '请提供接收人邮箱和完整的邮件回复内容' });
+    }
+
+    // 查找用户绑定的邮箱账号
+    let account = null;
+    if (emailAccountId) {
+      account = await prisma.userEmailAccount.findFirst({
+        where: { id: emailAccountId, userId: req.user.id }
+      });
+    } else {
+      account = await prisma.userEmailAccount.findFirst({
+        where: { userId: req.user.id }
+      });
+    }
+
+    if (!account) {
+      return res.status(400).json({ error: '尚未绑定发件邮箱账号，请先在页面绑定 QQ 邮箱或 163 邮箱' });
+    }
+
+    // 从收件人字符串中提取 Email 地址 (如："张老师" <admission@seu.edu.cn> -> admission@seu.edu.cn)
+    const emailAddrMatch = (to || '').match(/([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/);
+    const cleanToEmail = emailAddrMatch ? emailAddrMatch[1] : to.trim();
+
+    console.log(`[Sending Reply Email] From ${account.email} -> ${cleanToEmail}`);
+    const sendResult = await sendEmailViaSmtp(account, {
+      to: cleanToEmail,
+      subject: subject || '关于夏令营/预推免通知的回复',
+      text: content
+    });
+
+    if (!sendResult.success) {
+      return res.status(500).json({ error: sendResult.error || '邮件发送失败' });
+    }
+
+    res.json({
+      message: `邮件已通过您的邮箱 (${account.email}) 成功发送给 ${cleanToEmail}！`,
+      messageId: sendResult.messageId
+    });
+
+  } catch (error) {
+    console.error('Send reply email error:', error);
+    res.status(500).json({ error: '发送邮件失败: ' + error.message });
+  }
+});
 
 // Get all emails for user
 app.get('/api/emails', authenticateToken, async (req, res) => {
@@ -1696,6 +2126,136 @@ app.get('/api/interviews', authenticateToken, async (req, res) => {
     res.json(interviews);
   } catch (error) {
     res.status(500).json({ error: '获取列表失败' });
+  }
+});
+
+// --- 情绪打卡接口 (手动打卡或 AI 感知打卡) ---
+app.post('/api/emotions/log', authenticateToken, async (req, res) => {
+  try {
+    const { emotion, score, source = 'manual', note } = req.body;
+    if (!emotion) return res.status(400).json({ error: '缺少情绪参数' });
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const scoreMap = {
+      '焦虑': 40,
+      '平静': 65,
+      '充实': 85,
+      '疲惫': 35,
+      '期待': 80,
+      '沉稳': 70,
+      '狂喜': 95,
+      '反思': 60
+    };
+
+    const finalScore = Number.isInteger(score) ? score : (scoreMap[emotion] || 60);
+
+    const logged = await prisma.emotionLog.upsert({
+      where: {
+        userId_date: {
+          userId: req.user.id,
+          date: todayStr
+        }
+      },
+      create: {
+        userId: req.user.id,
+        date: todayStr,
+        emotion,
+        score: finalScore,
+        source,
+        note: note || (source === 'manual' ? '首页打卡' : 'AI对话分析')
+      },
+      update: {
+        emotion,
+        score: finalScore,
+        source,
+        note: note || (source === 'manual' ? '首页打卡' : 'AI对话分析')
+      }
+    });
+
+    res.json({ success: true, data: logged });
+  } catch (error) {
+    console.error('Emotion log error:', error);
+    res.status(500).json({ error: '情绪打卡失败: ' + error.message });
+  }
+});
+
+// --- 获取近 7 天真实情绪曲线数据 ---
+app.get('/api/emotions/7days', authenticateToken, async (req, res) => {
+  try {
+    const dates = [];
+    const dayLabels = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+    
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const dateStr = d.toISOString().slice(0, 10);
+      const isToday = i === 0;
+      const dayName = isToday ? '今天' : dayLabels[d.getDay()];
+      dates.push({ dateStr, dayName, d });
+    }
+
+    const logs = await prisma.emotionLog.findMany({
+      where: {
+        userId: req.user.id,
+        date: { in: dates.map(item => item.dateStr) }
+      }
+    });
+
+    const logMap = new Map(logs.map(l => [l.date, l]));
+
+    const defaultDefaults = [
+      { emotion: '沉稳', score: 70, color: '#94a3b8', tag: '备考·沉稳' },
+      { emotion: '焦虑', score: 40, color: '#f87171', tag: '面试·焦虑' },
+      { emotion: '狂喜', score: 95, color: '#f43f5e', tag: '入营·狂喜' },
+      { emotion: '平静', score: 65, color: '#10b981', tag: '旅学·平静' },
+      { emotion: '期待', score: 80, color: '#60a5fa', tag: '新城·期待' },
+      { emotion: '充实', score: 85, color: '#64748b', tag: '调研·充实' },
+      { emotion: '反思', score: 60, color: '#a16207', tag: '整理·反思' }
+    ];
+
+    const getScoreTheme = (score) => {
+      const val = Math.max(0, Math.min(100, score || 60));
+      if (val >= 80) return { color: '#f59e0b', gradient: 'linear-gradient(180deg, #f59e0b 0%, #c8923a 100%)' };
+      if (val >= 65) return { color: '#ca8a04', gradient: 'linear-gradient(180deg, #eab308 0%, #ca8a04 100%)' };
+      if (val >= 50) return { color: '#64748b', gradient: 'linear-gradient(180deg, #cbd5e1 0%, #64748b 100%)' };
+      return { color: '#ef4444', gradient: 'linear-gradient(180deg, #fca5a5 0%, #ef4444 100%)' };
+    };
+
+    const days = dates.map((item, idx) => {
+      const dbLog = logMap.get(item.dateStr);
+      if (dbLog) {
+        const theme = getScoreTheme(dbLog.score);
+        return {
+          date: item.dateStr,
+          dayLabel: item.dayName,
+          emotion: dbLog.emotion,
+          score: dbLog.score,
+          color: theme.color,
+          gradient: theme.gradient,
+          source: dbLog.source,
+          tag: `${dbLog.note || '打卡'} · ${dbLog.emotion}`,
+          isReal: true
+        };
+      }
+      const fallback = defaultDefaults[idx % defaultDefaults.length];
+      const theme = getScoreTheme(fallback.score);
+      return {
+        date: item.dateStr,
+        dayLabel: item.dayName,
+        emotion: fallback.emotion,
+        score: fallback.score,
+        color: theme.color,
+        gradient: theme.gradient,
+        source: 'default',
+        tag: fallback.tag,
+        isReal: false
+      };
+    });
+
+    res.json({ days });
+  } catch (error) {
+    console.error('Fetch 7days emotion error:', error);
+    res.status(500).json({ error: '获取情绪数据失败' });
   }
 });
 
